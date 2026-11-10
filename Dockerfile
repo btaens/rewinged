@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Builder image to compile the binary
-FROM golang:1.21 as builder
+FROM golang:1.25 as builder
 
 WORKDIR $GOPATH/src/rewinged/rewinged/
 COPY . .
