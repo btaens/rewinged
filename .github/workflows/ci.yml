@@ -1,0 +1,142 @@
+name: CI
+
+# Verified locally before committing: every gate below passes on this repo.
+# The release workflow (.github/workflows/build.yml) only runs on tags, so this
+# is what actually protects main and pull requests.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: CI reads the repo and publishes nothing.
+permissions:
+  contents: read
+
+# A new push to the same branch/PR supersedes the in-flight run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned deliberately. `@latest` means a lint release can turn a green main
+  # red without a code change, and the repo's staticcheck.conf rule set is
+  # version-dependent. Bump this on purpose, not accidentally.
+  # v0.8.2 is the release tag of honnef.co/go/tools (the cmd/staticcheck path
+  # has no tags of its own, so `@v2026.2.2` is not a resolvable version).
+  STATICCHECK_VERSION: v0.8.2
+
+jobs:
+  lint:
+    name: vet + staticcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          # Single source of truth: read the toolchain from go.mod (1.25.9)
+          # instead of duplicating the version here and letting it drift.
+          go-version-file: go.mod
+
+      - name: go mod tidy is clean
+        # -diff never writes files; it exits non-zero when tidy would change
+        # go.mod/go.sum, which is the check we want.
+        run: go mod tidy -diff
+
+      - name: go vet (linux)
+        run: go vet ./...
+
+      # Type-checks the *_test.go files for the windows target too. rewinged
+      # ships a windows binary, so windows-only compile errors must fail here
+      # rather than on release day.
+      - name: go vet (windows/amd64 target)
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: go vet ./...
+
+      # Runs over ./... on purpose. The release workflow only lints the root
+      # package (`staticcheck .`), which is how a data race in controllers/
+      # survived unnoticed. staticcheck.conf at the repo root is picked up.
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@${{ env.STATICCHECK_VERSION }} ./...
+
+  test:
+    name: test -race
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # -race needs cgo/gcc, which ubuntu-latest provides. Release builds set
+      # CGO_ENABLED=0; that is a separate concern from the test build here.
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+      # -race cannot see deadlocks or goroutine leaks that only show up
+      # uninstrumented, so keep one plain run as well.
+      - name: go test
+        run: go test -count=1 ./...
+
+  build:
+    name: cross-build + docker + goreleaser
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # fetch-depth: 0 because goreleaser derives the version from tags.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # Both release targets from .goreleaser.yaml, built on every PR.
+      - name: build linux/amd64 (CGO off)
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+          GOAMD64: v1
+        run: go build ./...
+
+      - name: build windows/amd64
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          GOAMD64: v1
+        run: go build ./...
+
+      # The public Dockerfile is not used by goreleaser (that uses
+      # Dockerfile.goreleaser against an already-built binary), so nothing else
+      # in CI would catch its toolchain drifting. It was broken this way:
+      # golang:1.21 cannot build a module declaring `go 1.25.9`.
+      - name: docker build
+        run: docker build -t rewinged:ci .
+
+      # Validates the release pipeline without publishing: config schema, the
+      # template-versioninfo.sh -> go generate pre-hooks, and cross-compilation.
+      - name: goversioninfo (needed by the windows pre-build hook)
+        run: go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
+
+      - name: goreleaser check
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> 2'
+          args: check
+
+      - name: goreleaser build (snapshot, no publish)
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> 2'
+          args: build --snapshot --clean

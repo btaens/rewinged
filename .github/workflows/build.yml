@@ -29,6 +29,11 @@ jobs:
         with:
           go-version: '1.25.x'
 
+      # Tags are not covered by the branch triggers in ci.yml, so this job must
+      # gate itself: never publish a binary that does not pass its own tests.
+      - name: Test
+        run: go test -race -count=1 ./...
+
       - name: Go lint
         run: |
           go install golang.org/x/lint/golint@latest
