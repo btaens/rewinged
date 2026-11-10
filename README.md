@@ -12,12 +12,14 @@ It is currently in [pre-1.0](https://semver.org/#spec-item-4) development so con
 - Search, list, show and install software - the core winget features
 - Automatically internalize package installers to serve them to machines without internet
 - Restrict access to the package source with Entra ID authentication
-- Package manifest versions from 1.1.0 to 1.10.0 are all supported simultaneously
+- Package manifest versions from 1.0.0 to 1.28.0 are all supported simultaneously
 - Runs on Windows, Linux and in Docker
 
 ## 🚧 Not Yet Working or Complete
 
 - Correlation of installed programs and programs in the repository is not perfect (in part due to [this](https://github.com/microsoft/winget-cli-restsource/issues/59) and [this](https://github.com/microsoft/winget-cli-restsource/issues/166))
+- Manifest version 1.28.0 adds the optional `DesiredStateConfiguration` field to installer and singleton manifests. rewinged accepts manifests that contain it, but does not serve that data, because no published winget REST API schema (the newest is 1.10.0) has a field for it.
+- All manifest files of one package must declare the same `ManifestVersion`. Files are grouped into a package by `PackageIdentifier` + `PackageVersion` + `ManifestVersion`, so bumping only the installer manifest to 1.28.0 while leaving the version and locale manifests on an older version makes the whole package fail to load. Bump all of a package's files together.
 - Live reload of manifests (works for new and changed manifests, but removals are only picked up on restart)
 - Probably other stuff? It's work-in-progress - please submit an issue and/or PR if you notice anything!
 

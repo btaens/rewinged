@@ -239,7 +239,11 @@ func unmarshalVersionManifest (manifestVersion string, node yaml.Node) (models.M
     var version models.Manifest_VersionManifestInterface
 
     switch manifestVersion {
-        case "1.1.0":
+        // Schema delta 1.0.0 -> 1.1.0 is purely additive (verified by diffing the upstream JSON
+        // schemas: every field 1.0.0 defines, 1.1.0 also defines, in properties, definitions and
+        // required lists; nothing was removed). So the 1.1.0 struct decodes 1.0.0 with the newer
+        // fields left at their zero values.
+        case "1.0.0", "1.1.0":
           version = &models.Manifest_VersionManifest_1_1_0{}
         case "1.2.0":
           version = &models.Manifest_VersionManifest_1_2_0{}
@@ -254,8 +258,9 @@ func unmarshalVersionManifest (manifestVersion string, node yaml.Node) (models.M
         case "1.9.0":
           version = &models.Manifest_VersionManifest_1_9_0{}
         // Manifest schemas 1.10.0 and 1.12.0 are identical except for the addition of the InstallerType "font",
-        // but I don't validate/enum the InstallerType field anyway.
-        case "1.10.0", "1.12.0":
+        // but I don't validate/enum the InstallerType field anyway. The 1.28.0 version manifest schema is
+        // identical to 1.12.0 except for its own embedded version string, so one struct covers all three.
+        case "1.10.0", "1.12.0", "1.28.0":
           version = &models.Manifest_VersionManifest_1_10_0{}
         default:
           return nil, errors.New("unsupported VersionManifest version " + manifestVersion)
@@ -273,7 +278,8 @@ func unmarshalInstallerManifest (manifestVersion string, node yaml.Node) (models
     var installer models.Manifest_InstallerManifestInterface
 
     switch manifestVersion {
-        case "1.1.0":
+        // See the VersionManifest switch above: 1.0.0 parses with the 1.1.0 struct.
+        case "1.0.0", "1.1.0":
             installer = &models.Manifest_InstallerManifest_1_1_0{}
         case "1.2.0":
             installer = &models.Manifest_InstallerManifest_1_2_0{}
@@ -289,7 +295,12 @@ func unmarshalInstallerManifest (manifestVersion string, node yaml.Node) (models
             installer = &models.Manifest_InstallerManifest_1_9_0{}
         // Manifest schemas 1.10.0 and 1.12.0 are identical except for the addition of the InstallerType "font",
         // but I don't validate/enum the InstallerType field anyway.
-        case "1.10.0", "1.12.0":
+        // Schema delta 1.12.0 -> 1.28.0 (verified by diffing the upstream JSON schemas): exactly one new
+        // optional field, DesiredStateConfiguration, holding DSC resource references. Nothing was removed,
+        // no enum changed and no new required field was added, so this struct parses 1.28.0 too.
+        // The field is intentionally NOT parsed: the newest winget REST API spec is 1.10.0 and it has no
+        // place for DSC data, so there is no API model to put it in. See information.go.
+        case "1.10.0", "1.12.0", "1.28.0":
             installer = &models.Manifest_InstallerManifest_1_10_0{}
         default:
             return nil, errors.New("unsupported InstallerManifest version " + manifestVersion)
@@ -307,7 +318,8 @@ func unmarshalLocaleManifest (manifestVersion string, node yaml.Node) (models.Ma
     var locale models.Manifest_LocaleManifestInterface
 
     switch manifestVersion {
-        case "1.1.0":
+        // See the VersionManifest switch above: 1.0.0 parses with the 1.1.0 struct.
+        case "1.0.0", "1.1.0":
             locale = &models.Manifest_LocaleManifest_1_1_0{}
         case "1.2.0":
             locale = &models.Manifest_LocaleManifest_1_2_0{}
@@ -323,7 +335,8 @@ func unmarshalLocaleManifest (manifestVersion string, node yaml.Node) (models.Ma
             locale = &models.Manifest_LocaleManifest_1_9_0{}
         // Manifest schemas 1.10.0 and 1.12.0 are identical except for the addition of the InstallerType "font",
         // but I don't validate/enum the InstallerType field anyway.
-        case "1.10.0", "1.12.0":
+        // The 1.28.0 locale schema is byte-identical to 1.12.0 except for its own embedded version string.
+        case "1.10.0", "1.12.0", "1.28.0":
             locale = &models.Manifest_LocaleManifest_1_10_0{}
         default:
             return nil, errors.New("unsupported LocaleManifest version " + manifestVersion)
@@ -341,7 +354,8 @@ func unmarshalDefaultLocaleManifest (manifestVersion string, node yaml.Node) (mo
     var defaultlocale models.Manifest_DefaultLocaleManifestInterface
 
     switch manifestVersion {
-        case "1.1.0":
+        // See the VersionManifest switch above: 1.0.0 parses with the 1.1.0 struct.
+        case "1.0.0", "1.1.0":
             defaultlocale = &models.Manifest_DefaultLocaleManifest_1_1_0{}
         case "1.2.0":
             defaultlocale = &models.Manifest_DefaultLocaleManifest_1_2_0{}
@@ -357,7 +371,8 @@ func unmarshalDefaultLocaleManifest (manifestVersion string, node yaml.Node) (mo
             defaultlocale = &models.Manifest_DefaultLocaleManifest_1_9_0{}
         // Manifest schemas 1.10.0 and 1.12.0 are identical except for the addition of the InstallerType "font",
         // but I don't validate/enum the InstallerType field anyway.
-        case "1.10.0", "1.12.0":
+        // The 1.28.0 defaultLocale schema is byte-identical to 1.12.0 except for its own embedded version string.
+        case "1.10.0", "1.12.0", "1.28.0":
             defaultlocale = &models.Manifest_DefaultLocaleManifest_1_10_0{}
         default:
             return nil, errors.New("unsupported DefaultLocaleManifest version " + manifestVersion)
@@ -471,7 +486,14 @@ func newAPIManifest (
   var apiReturnManifest models.API_ManifestInterface
   var apiMvi models.API_ManifestVersionInterface
 
-  if ManifestVersion == "1.1.0" {
+  // 1.0.0 manifests are converted with the API v1.1.0 shape. This is type-safe by
+  // construction: the parse layer decodes 1.0.0 into the Manifest_*_1_1_0 structs, whose
+  // ToApi* methods already return API_*_1_1_0 values, so the assertions below hold. It is
+  // also semantically safe because ManifestVersion does not appear in any winget REST API
+  // response schema (verified against the published WinGet-1.0.0.yaml and WinGet-1.1.0.yaml),
+  // so the client cannot observe a mismatch between the manifest version on disk and the
+  // API shape used to serve it.
+  if ManifestVersion == "1.0.0" || ManifestVersion == "1.1.0" {
     var apiLocales []models.API_Locale_1_1_0
     for _, locale := range l {
       apiLocales = append(apiLocales, locale.(models.API_Locale_1_1_0))
@@ -611,9 +633,12 @@ func newAPIManifest (
       PackageIdentifier: PackageIdentifier,
       Versions: []models.API_ManifestVersionInterface{ apiMvi },
     }
-  } else if ManifestVersion == "1.10.0" || ManifestVersion == "1.12.0" {
+  } else if ManifestVersion == "1.10.0" || ManifestVersion == "1.12.0" || ManifestVersion == "1.28.0" {
     // Manifest schemas 1.10.0 and 1.12.0 are identical except for the addition of the InstallerType "font",
     // but I don't validate/enum the InstallerType field anyway. A separate API schema v1.12.0 doesn't even exist at all.
+    // The same holds for 1.28.0: no newer REST API schema has been published upstream (newest is 1.10.0), and the
+    // only manifest-schema change is the DesiredStateConfiguration field, which has no representation in any
+    // published API schema, so 1.28.0 packages are served as API v1.10.0 responses.
     var apiLocales []models.API_Locale_1_10_0
     for _, locale := range l {
       apiLocales = append(apiLocales, locale.(models.API_Locale_1_10_0))
@@ -694,7 +719,8 @@ func unmarshalSingletonManifest (manifestVersion string, node yaml.Node) (models
     var smanifest models.Manifest_SingletonManifestInterface
 
     switch manifestVersion {
-        case "1.1.0":
+        // See the VersionManifest switch above: 1.0.0 parses with the 1.1.0 struct.
+        case "1.0.0", "1.1.0":
             smanifest = &models.Manifest_SingletonManifest_1_1_0{}
         case "1.2.0":
             smanifest = &models.Manifest_SingletonManifest_1_2_0{}
@@ -710,7 +736,9 @@ func unmarshalSingletonManifest (manifestVersion string, node yaml.Node) (models
             smanifest = &models.Manifest_SingletonManifest_1_9_0{}
         // Manifest schemas 1.10.0 and 1.12.0 are identical except for the addition of the InstallerType "font",
         // but I don't validate/enum the InstallerType field anyway.
-        case "1.10.0", "1.12.0":
+        // Schema delta 1.12.0 -> 1.28.0 is one new optional field, DesiredStateConfiguration, which the
+        // newest published winget REST API (1.10.0) has no field for, so it is not parsed. See information.go.
+        case "1.10.0", "1.12.0", "1.28.0":
             smanifest = &models.Manifest_SingletonManifest_1_10_0{}
         default:
             return nil, errors.New("unsupported SingletonManifest version " + manifestVersion)
