@@ -91,6 +91,28 @@ func (store *InternalizedInstallersStore) Get(installerSha string) bool {
     return store.internal[installerSha]
 }
 
+// Internal in-memory mapping of installer SHA (lowercase) to its original
+// InstallerUrl. Populated during manifest ingestion when on-demand
+// internalization is enabled but the installer has not been downloaded yet,
+// so the /installers/ handler knows where to fetch it from on first request.
+type InstallerSourcesStore struct {
+    sync.RWMutex
+    internal map[string]string
+}
+
+func (store *InstallerSourcesStore) Set(installerSha string, installerUrl string) {
+    store.Lock()
+    store.internal[installerSha] = installerUrl
+    store.Unlock()
+}
+
+func (store *InstallerSourcesStore) Get(installerSha string) (string, bool) {
+    store.RLock()
+    defer store.RUnlock()
+    url, ok := store.internal[installerSha]
+    return url, ok
+}
+
 // Internal in-memory data store of all manifest data
 type ManifestsStore struct {
     sync.RWMutex
@@ -146,8 +168,7 @@ func (ms *ManifestsStore) GetAllPackageIdentifiers() (value []API_Package) {
 
 func (ms *ManifestsStore) GetManifestCount() (value int) {
     ms.RLock()
-    var count int
-    count = len(Manifests.internal)
+    count := len(ms.internal)
     ms.RUnlock()
     return count
 }
@@ -358,6 +379,12 @@ func isDefault(v reflect.Value) bool {
 // internalized on manifest ingestion and can have their InstallerUrls rewritten.
 var InternalizedInstallers = InternalizedInstallersStore{
     internal: make(map[string]bool),
+}
+
+// This map is used to remember the original InstallerUrl of installers that
+// are eligible for on-demand internalization but not downloaded yet.
+var InstallerSources = InstallerSourcesStore{
+    internal: make(map[string]string),
 }
 
 // Global variable that will hold all in-memory manifest data

@@ -44,6 +44,7 @@ func main() {
         tlsPrivateKeyPtr       = fs.String("httpsPrivateKeyFile", "./private.key", "The private key file to use if HTTPS is enabled")
         listenAddrPtr          = fs.String("listen", "localhost:8080", "The address and port for the REST API to listen on")
         autoInternalizePtr     = fs.Bool("autoInternalize", false, "Turn on the auto-internalization feature")
+        autoInternalizeOnDemandPtr = fs.Bool("autoInternalizeOnDemand", false, "Only download auto-internalized installers on first client request instead of at startup")
         autoInternalizePathPtr = fs.String("autoInternalizePath", "./installers", "The directory where auto-internalized installers will be stored")
         autoInternalizeSkipPtr = fs.String("autoInternalizeSkip", "", "List of hostnames excluded from auto-internalization (comma or space to separate)")
         sourceAuthTypePtr             = fs.String("sourceAuthType", "none", "Require authentication to interact with the REST API: none, microsoftEntraId")
@@ -80,6 +81,10 @@ func main() {
 
     if *sourceAuthTypePtr != "microsoftEntraId" && *sourceAuthTypePtr != "none" {
         logging.Logger.Fatal().Msg("sourceAuthType must be either none or microsoftEntraId")
+    }
+
+    if *autoInternalizeOnDemandPtr && !*autoInternalizePtr {
+        logging.Logger.Fatal().Msg("autoInternalizeOnDemand requires autoInternalize")
     }
 
     // sourceAuthEntraIDResource is required if sourceAuthType is "microsoftEntraId"
@@ -128,7 +133,7 @@ func main() {
 
     // Start up 6 worker goroutines that can parse in manifest-files from one directory each
     for w := 1; w <= 6; w++ {
-        go ingestManifestsWorker(*autoInternalizePtr, *autoInternalizePathPtr, autoInternalizeSkipHosts)
+        go ingestManifestsWorker(*autoInternalizePtr, *autoInternalizeOnDemandPtr, *autoInternalizePathPtr, autoInternalizeSkipHosts)
     }
 
     getManifests(*packagePathPtr)
@@ -188,21 +193,30 @@ func main() {
         InternalizationEnabled: *autoInternalizePtr,
     }
 
+    var installersHandler http.Handler
+    if *autoInternalizeOnDemandPtr {
+        if err := os.MkdirAll(*autoInternalizePathPtr, 0o755); err != nil {
+            logging.Logger.Fatal().Err(err).Msg("could not create autoInternalizePath")
+        }
+        installersHandler = controllers.NewInstallerDownloadHandler(*autoInternalizePathPtr)
+    } else {
+        installersHandler = hideDirectoryListings(http.FileServer(http.Dir(*autoInternalizePathPtr)))
+    }
+
     router := http.NewServeMux()
 
     // TODO: Recovery maybe?
 
-    fileServer := http.FileServer(http.Dir(*autoInternalizePathPtr))
     router.HandleFunc("GET /api/information", controllers.GetInformation)
 
     switch settings.SourceAuthenticationType {
     case "none":
-        router.Handle("/installers/", http.StripPrefix("/installers", hideDirectoryListings(fileServer)))
+        router.Handle("/installers/", http.StripPrefix("/installers", installersHandler))
         router.Handle("GET /api/packages", http.HandlerFunc(controllers.GetPackages))
         router.Handle("POST /api/manifestSearch", http.HandlerFunc(controllers.SearchForPackage))
         router.Handle("GET /api/packageManifests/{package_identifier}", http.HandlerFunc(getPackagesConfig.GetPackage))
     case "microsoftEntraId":
-        router.Handle("/installers/", http.StripPrefix("/installers", controllers.JWTAuthMiddleware(hideDirectoryListings(fileServer))))
+        router.Handle("/installers/", http.StripPrefix("/installers", controllers.JWTAuthMiddleware(installersHandler)))
         router.Handle("GET /api/packages", controllers.JWTAuthMiddleware(http.HandlerFunc(controllers.GetPackages)))
         router.Handle("POST /api/manifestSearch", controllers.JWTAuthMiddleware(http.HandlerFunc(controllers.SearchForPackage)))
         router.Handle("GET /api/packageManifests/{package_identifier}", controllers.JWTAuthMiddleware(http.HandlerFunc(getPackagesConfig.GetPackage)))

@@ -49,6 +49,8 @@ Commandline arguments have the highest priority and take precedence over both en
 ```
   -autoInternalize
         Turn on the auto-internalization feature
+  -autoInternalizeOnDemand
+        Only download auto-internalized installers on first client request instead of at startup
   -autoInternalizePath string
         The directory where auto-internalized installers will be stored (default "./installers")
   -autoInternalizeSkip string
@@ -89,6 +91,7 @@ Environment variables take precedence over the configuration file, but are overr
 ```
 REWINGED_CONFIGFILE (string)
 REWINGED_AUTOINTERNALIZE (bool)
+REWINGED_AUTOINTERNALIZEONDEMAND (bool)
 REWINGED_AUTOINTERNALIZEPATH (string)
 REWINGED_AUTOINTERNALIZESKIP (string)
 REWINGED_HTTPS (bool)
@@ -114,6 +117,7 @@ rewinged will not look for any configuration file by default. Config file must b
 ```json
 {
   "autoInternalize": false,
+  "autoInternalizeOnDemand": false,
   "autoInternalizePath": "./installers",
   "autoInternalizeSkip": "",
   "https": false,
@@ -243,6 +247,24 @@ to store them locally. For example:
 ```
 ./rewinged -autoInternalize -autoInternalizeSkip "internal.example.org github.com"
 ```
+
+### On-demand downloading
+
+By default rewinged downloads **all** installers referenced in your manifests at startup. For large
+repositories (such as the official winget community repository) this is an unreasonable amount of data
+to store up front. With `-autoInternalizeOnDemand` (requires `-autoInternalize`), installers are only
+downloaded the first time a client actually requests one, and then served from the local cache to all
+later requests:
+
+```
+./rewinged -autoInternalize -autoInternalizeOnDemand
+```
+
+InstallerUrls are still rewritten to point at rewinged even before a file has been downloaded, so this
+works for clients that have no internet access at all. If two clients request the same not-yet-cached
+installer simultaneously, it is downloaded only once and both receive it. Downloaded files are verified
+against the SHA-256 declared in the manifest before being cached. If a download fails (origin
+unreachable, hash mismatch), the client receives an HTTP 502 and the next request retries the download.
 
 ## 🔒 Entra ID Authentication
 

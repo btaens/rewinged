@@ -5,6 +5,7 @@ import (
     "strings"
     "net/http"
     "encoding/json"
+    "sync"
 
     "rewinged/logging"
     "rewinged/settings"
@@ -26,9 +27,19 @@ func GetPackages(w http.ResponseWriter, r *http.Request) {
 type GetPackageHandler struct {
     TlsEnabled bool
     InternalizationEnabled bool
+
+    // mu serializes the installer-URL rewrite against the JSON response.
+    // GetAllVersions hands out references to the manifests as stored in the
+    // global Manifests store, and GetInstallers() returns pointers into those
+    // stored structs, so rewriting InstallerUrl mutates shared state. Without
+    // this lock, concurrent requests (a) race on that shared field and (b) can
+    // hand a client a download URL derived from another client's request
+    // headers, because the rewritten origin differs per request
+    // (X-Forwarded-Host vs r.Host).
+    mu sync.Mutex
 }
 
-func (this *GetPackageHandler) GetPackage(w http.ResponseWriter, r *http.Request) {
+func (h *GetPackageHandler) GetPackage(w http.ResponseWriter, r *http.Request) {
   logging.Logger.Debug().Msgf("/packageManifests: Someone tried to GET package '%v' with query params: %v", r.PathValue("package_identifier"), r.URL.Query())
   logging.Logger.Debug().Msgf("client requested API version %v", r.Header.Get("Version"))
 
@@ -40,7 +51,14 @@ func (this *GetPackageHandler) GetPackage(w http.ResponseWriter, r *http.Request
 
   var pkg []models.API_ManifestVersionInterface = models.Manifests.GetAllVersions(r.PathValue("package_identifier"))
 
-  if this.InternalizationEnabled {
+  // Serialize the rewrite + response: see the comment on GetPackageHandler.mu.
+  // Manifest responses are small and fetched only a few times per install, so
+  // this serialization has no measurable cost, but it is what keeps the shared
+  // installer metadata from being mutated under another request's feet.
+  h.mu.Lock()
+  defer h.mu.Unlock()
+
+  if h.InternalizationEnabled {
       var rewrittenOrigin string
       // TODO: Only accept these headers if c.RemoteIP() is a trusted proxy configured by the user
       xfProto := r.Header.Values("X-Forwarded-Proto")
@@ -52,7 +70,7 @@ func (this *GetPackageHandler) GetPackage(w http.ResponseWriter, r *http.Request
           )
       } else {
           var proto string
-          if this.TlsEnabled {
+          if h.TlsEnabled {
               proto = "https"
           } else {
               proto = "http"
@@ -169,7 +187,7 @@ func SearchForPackage(w http.ResponseWriter, r *http.Request) {
   if post.Query.KeyWord != "" {
     logging.Logger.Debug().Msgf("someone searched the repo for: %v", post.Query.KeyWord)
     results = models.Manifests.GetByKeyword(post.Query.KeyWord)
-  } else if (post.Inclusions != nil && len(post.Inclusions) > 0) || (post.Filters != nil && len(post.Filters) > 0) {
+  } else if len(post.Inclusions) > 0 || len(post.Filters) > 0 {
     logging.Logger.Debug().Msg("advanced search with inclusions[] and/or filters[]")
     results = models.Manifests.GetByMatchFilter(post.Inclusions, post.Filters)
   }

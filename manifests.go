@@ -17,7 +17,7 @@ import (
   "rewinged/models"
 )
 
-func ingestManifestsWorker(autoInternalize bool, autoInternalizePath string, autoInternalizeSkipHosts []string) error {
+func ingestManifestsWorker(autoInternalize bool, autoInternalizeOnDemand bool, autoInternalizePath string, autoInternalizeSkipHosts []string) error {
   for path := range jobs {
     files, err := os.ReadDir(path)
     if err != nil {
@@ -56,7 +56,7 @@ func ingestManifestsWorker(autoInternalize bool, autoInternalizePath string, aut
                   if (autoInternalize) {
                     var installers []models.API_InstallerInterface = version.GetInstallers()
 
-                    internalizeInstallers(basemanifest.PackageIdentifier, basemanifest.PackageVersion, installers, autoInternalizePath, autoInternalizeSkipHosts)
+                    internalizeInstallers(basemanifest.PackageIdentifier, basemanifest.PackageVersion, installers, autoInternalizeOnDemand, autoInternalizePath, autoInternalizeSkipHosts)
 
                     // Recreate manifest object, but with overwritten values (InstallerUrl(s))
                     manifest, err = newAPIManifest(
@@ -103,7 +103,7 @@ func ingestManifestsWorker(autoInternalize bool, autoInternalizePath string, aut
             if (autoInternalize) {
               var installers []models.API_InstallerInterface = version.GetInstallers()
 
-              internalizeInstallers(key.PackageIdentifier, key.PackageVersion, installers, autoInternalizePath, autoInternalizeSkipHosts)
+              internalizeInstallers(key.PackageIdentifier, key.PackageVersion, installers, autoInternalizeOnDemand, autoInternalizePath, autoInternalizeSkipHosts)
 
               // Recreate manifest object, but with overwritten values (InstallerUrl(s))
               overwrittenMergedManifest, err := newAPIManifest(
@@ -140,6 +140,7 @@ func internalizeInstallers(
   packageIdentifier string,
   packageVersion string,
   installers []models.API_InstallerInterface,
+  autoInternalizeOnDemand bool,
   autoInternalizePath string,
   autoInternalizeSkipHosts []string,
 ) {
@@ -152,6 +153,17 @@ func internalizeInstallers(
     }
     if slices.Contains(autoInternalizeSkipHosts, u.Hostname()) {
       logging.Logger.Debug().Str("package", packageIdentifier).Str("packageversion", packageVersion).Msgf("not internalizing %s", originalInstallerURL)
+      continue
+    }
+
+    // In on-demand mode we never download during ingestion. We only remember where
+    // the installer came from so the /installers/ handler can fetch it the first
+    // time a client asks for it. The InstallerUrl is still rewritten to point at
+    // rewinged because clients on the internal network cannot reach the origin.
+    if autoInternalizeOnDemand {
+      models.InstallerSources.Set(strings.ToLower(installer.GetInstallerSha()), originalInstallerURL)
+      models.InternalizedInstallers.Set(installer.GetInstallerSha(), true)
+      logging.Logger.Trace().Str("package", packageIdentifier).Str("packageversion", packageVersion).Msgf("marked installer for on-demand internalization")
       continue
     }
 
