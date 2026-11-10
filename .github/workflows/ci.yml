@@ -26,6 +26,13 @@ env:
   # v0.8.2 is the release tag of honnef.co/go/tools (the cmd/staticcheck path
   # has no tags of its own, so `@v2026.2.2` is not a resolvable version).
   STATICCHECK_VERSION: v0.8.2
+  # staticcheck 0.8.x needs go >= 1.26 to COMPILE, but go.mod pins the project
+  # to 1.25.9 and setup-go defaults GOTOOLCHAIN=local, so the tool build fails.
+  # `go run pkg@ver` builds the tool in its own module graph, separate from the
+  # module under test, so escalating only this step's toolchain leaves vet/build/
+  # test on 1.25.9. Pinned to 0.8.x's floor rather than `auto`, which would
+  # resolve to whatever go is newest that day and drift the analysis silently.
+  STATICCHECK_GO_VERSION: go1.26.0
 
 jobs:
   lint:
@@ -62,6 +69,8 @@ jobs:
       # package (`staticcheck .`), which is how a data race in controllers/
       # survived unnoticed. staticcheck.conf at the repo root is picked up.
       - name: staticcheck
+        env:
+          GOTOOLCHAIN: ${{ env.STATICCHECK_GO_VERSION }}
         run: go run honnef.co/go/tools/cmd/staticcheck@${{ env.STATICCHECK_VERSION }} ./...
 
   test:

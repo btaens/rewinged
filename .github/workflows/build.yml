@@ -40,9 +40,18 @@ jobs:
           golint .
 
       - name: Staticcheck
+        # Same toolchain split as ci.yml: staticcheck 0.8.x requires go >= 1.26
+        # to compile, while the release build itself stays on the 1.25.x declared
+        # in go.mod. `go install pkg@ver` builds in the tool's own module graph,
+        # so escalating GOTOOLCHAIN here does not change what gets shipped.
+        # Pinned, not @latest: an unpinned lint release can turn a release red
+        # without a code change. ./... not `.` -- the root-only scope is how a
+        # data race in controllers/ went unnoticed.
+        env:
+          GOTOOLCHAIN: go1.26.0
         run: |
-          go install honnef.co/go/tools/cmd/staticcheck@latest
-          staticcheck .
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
+          staticcheck ./...
 
       - name: Install goversioninfo
         run: |
