@@ -101,7 +101,7 @@ type API_Installer_1_9_0 struct {
     SignatureSha256 string `yaml:"SignatureSha256" json:",omitempty"` // winget runs into an exception internally when this is an empty string (ParseFromHexString: Invalid value size), so omit in API responses if empty
     InstallModes []string `yaml:"InstallModes"`
     InstallerSwitches API_InstallerSwitches_1_9_0 `yaml:"InstallerSwitches"`
-    InstallerSuccessCodes []int64 `yaml:"InstallerSuccessCodes" json:",omitempty"`
+    InstallerSuccessCodes []InstallerReturnCode `yaml:"InstallerSuccessCodes" json:",omitempty"`
     ExpectedReturnCodes []API_ExpectedReturnCode_1_9_0 `yaml:"ExpectedReturnCodes"`
     UpgradeBehavior string `yaml:"UpgradeBehavior" json:",omitempty"`
     Commands []string `yaml:"Commands" json:",omitempty"`
@@ -253,7 +253,7 @@ type API_InstallerSwitches_1_9_0 struct {
 }
 
 type API_ExpectedReturnCode_1_9_0 struct {
-    InstallerReturnCode int64 `yaml:"InstallerReturnCode"`
+    InstallerReturnCode InstallerReturnCode `yaml:"InstallerReturnCode"`
     ReturnResponse string `yaml:"ReturnResponse"`
     ReturnResponseUrl string `yaml:"ReturnResponseUrl"`
 }

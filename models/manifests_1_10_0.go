@@ -88,7 +88,7 @@ type Manifest_InstallerManifest_1_10_0 struct {
     Scope string `yaml:"Scope" json:",omitempty"`
     InstallModes []string `yaml:"InstallModes" json:",omitempty"`
     InstallerSwitches Manifest_InstallerSwitches_1_10_0 `yaml:"InstallerSwitches"`
-    InstallerSuccessCodes []int64 `yaml:"InstallerSuccessCodes" json:",omitempty"`
+    InstallerSuccessCodes []InstallerReturnCode `yaml:"InstallerSuccessCodes" json:",omitempty"`
     ExpectedReturnCodes []Manifest_ExpectedReturnCode_1_10_0 `yaml:"ExpectedReturnCodes" json:",omitempty"`
     UpgradeBehavior string `yaml:"UpgradeBehavior" json:",omitempty"` // enum of either install or uninstallPrevious
     Commands []string `yaml:"Commands" json:",omitempty"`
@@ -217,7 +217,7 @@ type Manifest_Installer_1_10_0 struct {
     SignatureSha256 string `yaml:"SignatureSha256" json:",omitempty"` // winget runs into an exception internally when this is an empty string (ParseFromHexString: Invalid value size), so omit in API responses if empty
     InstallModes []string `yaml:"InstallModes"`
     InstallerSwitches Manifest_InstallerSwitches_1_10_0 `yaml:"InstallerSwitches"`
-    InstallerSuccessCodes []int64 `yaml:"InstallerSuccessCodes" json:",omitempty"`
+    InstallerSuccessCodes []InstallerReturnCode `yaml:"InstallerSuccessCodes" json:",omitempty"`
     ExpectedReturnCodes []Manifest_ExpectedReturnCode_1_10_0 `yaml:"ExpectedReturnCodes"`
     UpgradeBehavior string `yaml:"UpgradeBehavior" json:",omitempty"`
     Commands []string `yaml:"Commands" json:",omitempty"`
@@ -456,7 +456,7 @@ type Manifest_InstallerSwitches_1_10_0 struct {
 }
 
 type Manifest_ExpectedReturnCode_1_10_0 struct {
-    InstallerReturnCode int64 `yaml:"InstallerReturnCode"`
+    InstallerReturnCode InstallerReturnCode `yaml:"InstallerReturnCode"`
     ReturnResponse string `yaml:"ReturnResponse"`
     ReturnResponseUrl string `yaml:"ReturnResponseUrl"`
 }
