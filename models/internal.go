@@ -303,18 +303,61 @@ var supportedSearchFields = map[string]bool{
 // live-log Intel entry confirms it: ARP name "Intel(R) Graphics Software &
 // Drivers" arrives as KeyWord "intelgraphicssoftwaredrivers", without the R.
 //
-// Known gap versus full parity: the client additionally strips standalone
-// architecture/locale/version tokens before joining ("7-Zip (x64)" -> "7zip").
-// The bracketed forms are already covered by the bracket pass; bare ones
-// ("Mozilla Firefox 159.0" -> "mozillafirefox") only matter when a manifest
-// name itself carries a version token the ARP keyword lacks, which does not
-// occur in practice. The ICU regex port stays deferred.
-var bracketEnclosedRe = regexp.MustCompile(`\([^()]*\)|\[[^\[\]]*\]|"[^"]*"`)
+// Token stripping: the client also removes version tokens before joining, and
+// the Microsoft.DotNet.SDK.8 correlation proves it is load-bearing:
+// PackageName "Microsoft .NET SDK 8.0" arrives on the wire as KeyWord
+// "microsoftnetsdk" - the trailing "8.0" is stripped client-side, so the server
+// must strip it too or the pair inclusion matches nothing and only the
+// installed version (burn GUIDs are per-version) is ever found.
+//
+// Same mechanism, second log datum: "Microsoft Visual C++ v14 Redistributable
+// (x64)" arrives as "microsoftvisualcredistributable", i.e. the bare "v14" is
+// removed by the client's Version-prefix rule while "c" survives.
+//
+// Go's regexp is RE2 and has no lookbehind, so the ICU patterns from
+// NameNormalization.cpp are decomposed into explicit boundary alternatives;
+// trailing-boundary lookaheads like (?=\P{Nd}|$) cannot be expressed at all.
+// Architecture and locale tokens are therefore not stripped as standalone
+// rules: every log case carries them bracket-enclosed ("(x64)", "(x64 en-US)"),
+// which the bracket pass already removes, and adding standalone rules would
+// need lookahead or risk eating digits that the client keeps (the lone "11" in
+// "Windows 11 Installation Assistant" survives as "windows11telepítésisegéd").
+// A bare arch/locale token outside brackets stays a known gap.
+var (
+    bracketEnclosedRe = regexp.MustCompile(`\([^()]*\)|\[[^\[\]]*\]|"[^"]*"`)
+    // kbNumberRe extracts patch identifiers from parentheses before the bracket
+    // pass so they survive, as they do on the client.
+    kbNumberRe = regexp.MustCompile(`\((kb\d+)\)`)
+    // versionDelimitedRe: digits joined to further digit groups by punctuation
+    // ("8.0", "154.0.4258.48", "26.03.00.0"). A lone number with no
+    // punctuation digit group does NOT match: the log proves the client keeps
+    // "11" in "Windows 11 Installation Assistant" and "2024" in
+    // "Microsoft Office LTSC Professional Plus 2024" (keywords
+    // "windows11telepítésisegéd", "...professionalplus2024proof").
+    versionDelimitedRe = regexp.MustCompile(`(?:^|[^\p{L}\p{Nd}])(?:v|ver|versi(?:o|ó)n|versão|versie|wersja|build|release|rc|sp)\p{L}?\p{Nd}+(?:[\p{Po}\p{Pd}\p{Pc}]\p{Nd}?(?:rc|b|a|r|sp|k)?\p{Nd}+)+[\p{Po}\p{Pd}\p{Pc}]?[\p{L}\p{Nd}]*|(?:^|[^\p{L}\p{Nd}])\p{Nd}+(?:[\p{Po}\p{Pd}\p{Pc}]\p{Nd}?(?:rc|b|a|r|sp|k)?\p{Nd}+)+[\p{Po}\p{Pd}\p{Pc}]?[\p{L}\p{Nd}]*`)
+    // versionWordRe: a version word led token, digits required ("v14",
+    // "version 2.1", "build 17"). The live log pins "v14":
+    // "Microsoft Visual C++ v14 Redistributable (x64)" arrives as
+    // "microsoftvisualcredistributable" - the v14 goes, the c stays. Digits
+    // being mandatory is what keeps the bare "v" of words like "visual" safe.
+    versionWordRe = regexp.MustCompile(`(?:^|[^\p{L}])(?:p|v|r|ver|versi(?:o|ó)n|versão|versie|wersja|build|release|rc|sp)(?:\P{L}|\P{L}\p{L})?(?:\p{Nd}|\.\p{Nd})+(?:rc|b|a|r|v|sp)?\p{Nd}?`)
+)
 
 func normalizePackageName(name string) string {
     lower := strings.ToLower(name)
+    lower = kbNumberRe.ReplaceAllString(lower, "$1")
     for {
         next := bracketEnclosedRe.ReplaceAllString(lower, "")
+        if next == lower {
+            break
+        }
+        lower = next
+    }
+    // Version rules run repeatedly until stable, as the client loops its
+    // ProgramNameRegexes. Each pass either shortens the string or stops.
+    for {
+        next := versionDelimitedRe.ReplaceAllString(lower, "")
+        next = versionWordRe.ReplaceAllString(next, "")
         if next == lower {
             break
         }

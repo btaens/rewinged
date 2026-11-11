@@ -370,11 +370,19 @@ func TestNormalizedPackageNamePublisherMatchesPunctuatedName(t *testing.T) {
 }
 
 func TestNormalizePackageNameCharacterClass(t *testing.T) {
-	// The client keeps Unicode letters and digits and removes everything else;
-	// the accented case is from the same live log (a Hungarian ARP display name
-	// arrives with á/ő intact), so an ASCII-only filter would break it.
+	// Inputs and expected outputs are taken from the live winget 1.29.380
+	// correlation log: the client keeps Unicode letters and digits, drops
+	// bracket-enclosed groups, and strips dotted version tokens. "windows11…"
+	// pins that a LONE number survives (VersionDelimited requires a
+	// punctuation-joined digit group), while "sdk 8.0" and "v14" must be
+	// stripped.
 	for _, tc := range []struct{ in, want string }{
 		{"draw.io", "drawio"},
+		{"Microsoft .NET SDK 8.0", "microsoftnetsdk"},
+		{"Microsoft .NET Windows Desktop Runtime 10.0", "microsoftnetwindowsdesktopruntime"},
+		{"Microsoft Visual C++ v14 Redistributable (x64)", "microsoftvisualcredistributable"},
+		{"Windows 11 Installation Assistant", "windows11installationassistant"},
+		{"Microsoft Office LTSC Professional Plus 2024", "microsoftofficeltscprofessionalplus2024"},
 		{"Mozilla Firefox", "mozillafirefox"},
 		{"7-Zip", "7zip"},
 		{"WinSSH-Pageant", "winsshpageant"},
@@ -382,9 +390,48 @@ func TestNormalizePackageNameCharacterClass(t *testing.T) {
 		{"Microsoft PC állapotellenőrzés", "microsoftpcállapotellenőrzés"},
 		{"C++ Builder", "cbuilder"},
 		{"Éditeur #1", "éditeur1"},
+		{"Some App (KB5034441)", "someappkb5034441"},
 	} {
 		if got := normalizePackageName(tc.in); got != tc.want {
 			t.Errorf("normalizePackageName(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// Second live-log regression: Microsoft.DotNet.SDK.8 uses burn installers with
+// per-release GUIDs and a PackageName carrying a version token
+// ("Microsoft .NET SDK 8.0" -> client KeyWord "microsoftnetsdk"). Before the
+// token strip the pair inclusion matched zero versions and the response
+// contained only the installed release, so `winget list` never offered the
+// newer one.
+func TestSDKStyleVersionTokenInNameStillCorrelates(t *testing.T) {
+	ms := &ManifestsStore{}
+	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)
+	for _, tc := range []struct{ version, productCode string }{
+		{"8.0.425", "{AB39B1D0-4847-4C0D-A1C1-B2BE697F2B76}"},
+		{"8.0.428", "{D76560AF-3660-42AF-8CEB-47FC58A70915}"},
+	} {
+		ms.Set("Microsoft.DotNet.SDK.8", tc.version, &API_ManifestVersion_1_10_0{
+			PackageVersion: tc.version,
+			DefaultLocale: API_DefaultLocale_1_10_0{
+				PackageName:      "Microsoft .NET SDK 8.0",
+				Publisher:        "Microsoft Corporation",
+				ShortDescription: ".NET SDK",
+			},
+			Installers: []API_Installer_1_10_0{{ProductCode: tc.productCode}},
+		})
+	}
+
+	// Exact wire body from the log for the installed 8.0.425.
+	res, _ := ms.GetByMatchFilter(
+		[]API_SearchRequestPackageMatchFilter_1_1_0{
+			{PackageMatchField: "ProductCode", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "{ab39b1d0-4847-4c0d-a1c1-b2be697f2b76}"}},
+			{PackageMatchField: "NormalizedPackageNameAndPublisher", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "microsoftnetsdk"}},
+			{PackageMatchField: "NormalizedPackageNameAndPublisher", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "microsoftnetsdk(x64)"}},
+		},
+		nil,
+	)
+	if got := len(res["Microsoft.DotNet.SDK.8"]); got != 2 {
+		t.Errorf("SDK correlation returned %d versions, want both 2 (so 8.0.428 shows as Available)", got)
 	}
 }
