@@ -220,7 +220,7 @@ func TestGetByKeywordAndFiltersSmoke(t *testing.T) {
 		t.Errorf("no-match keyword returned %d results, want 0", len(res))
 	}
 
-	res := ms.GetByMatchFilter(
+	res, unsupported := ms.GetByMatchFilter(
 		[]API_SearchRequestPackageMatchFilter_1_1_0{{
 			PackageMatchField: "PackageIdentifier",
 			RequestMatch:      API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "Example.Laptop"},
@@ -229,5 +229,8 @@ func TestGetByKeywordAndFiltersSmoke(t *testing.T) {
 	)
 	if len(res) != 1 {
 		t.Errorf("filter search returned %d results, want 1", len(res))
+	}
+	if len(unsupported) != 0 {
+		t.Errorf("unsupported fields = %v, want none", unsupported)
 	}
 }

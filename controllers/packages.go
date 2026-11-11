@@ -174,9 +174,17 @@ func SearchForPackage(w http.ResponseWriter, r *http.Request) {
   }
 
   logging.Logger.Debug().Msgf("%+v", post)
-  response := &models.API_ManifestSearchResult[models.API_ManifestSearchVersion_1_1_0]{
+  // The search response version schema is served in its 1.4.0+ shape, which
+  // adds UpgradeCodes and AppsAndFeaturesEntryVersions on top of the 1.1.0
+  // fields. rewinged does not negotiate API dialects per request (see the
+  // comment in controllers/information.go), and the winget client ignores
+  // response keys its schema doesn't know, so the superset is safe for older
+  // clients while clients >= 1.4 use these fields for installed-program
+  // correlation (SearchResponseDeserializer_1_4 reads both).
+  response := &models.API_ManifestSearchResult[models.API_ManifestSearchVersion_1_4_0]{
     RequiredPackageMatchFields: []string{},
-    Data: []models.API_ManifestSearchResponse[models.API_ManifestSearchVersion_1_1_0] {},
+    UnsupportedPackageMatchFields: []string{},
+    Data: []models.API_ManifestSearchResponse[models.API_ManifestSearchVersion_1_4_0] {},
   }
 
   // results is a map where the PackageIdentifier is the key
@@ -189,7 +197,9 @@ func SearchForPackage(w http.ResponseWriter, r *http.Request) {
     results = models.Manifests.GetByKeyword(post.Query.KeyWord)
   } else if len(post.Inclusions) > 0 || len(post.Filters) > 0 {
     logging.Logger.Debug().Msg("advanced search with inclusions[] and/or filters[]")
-    results = models.Manifests.GetByMatchFilter(post.Inclusions, post.Filters)
+    var unsupported []string
+    results, unsupported = models.Manifests.GetByMatchFilter(post.Inclusions, post.Filters)
+    response.UnsupportedPackageMatchFields = unsupported
   }
 
   logging.Logger.Debug().Msgf("with %v results", len(results))
@@ -197,18 +207,20 @@ func SearchForPackage(w http.ResponseWriter, r *http.Request) {
   if len(results) > 0 {
     for packageId, packageVersions := range results {
       logging.Logger.Debug().Msgf("package %v with %v versions", packageId, len(packageVersions))
-      var versions []models.API_ManifestSearchVersion_1_1_0
+      var versions []models.API_ManifestSearchVersion_1_4_0
 
       for _, version := range packageVersions {
-        versions = append(versions, models.API_ManifestSearchVersion_1_1_0{
+        versions = append(versions, models.API_ManifestSearchVersion_1_4_0{
           PackageVersion: version.GetPackageVersion(),
           Channel: "",
-          PackageFamilyNames: []string{},
+          PackageFamilyNames: version.GetInstallerPackageFamilyNames(),
           ProductCodes: version.GetInstallerProductCodes(),
+          AppsAndFeaturesEntryVersions: version.GetAppsAndFeaturesEntryVersions(),
+          UpgradeCodes: version.GetInstallerUpgradeCodes(),
         })
       }
 
-      response.Data = append(response.Data, models.API_ManifestSearchResponse[models.API_ManifestSearchVersion_1_1_0]{
+      response.Data = append(response.Data, models.API_ManifestSearchResponse[models.API_ManifestSearchVersion_1_4_0]{
         PackageIdentifier: packageId,
         PackageName: packageVersions[0].GetDefaultLocalePackageName(),
         Publisher: packageVersions[0].GetDefaultLocalePublisher(),

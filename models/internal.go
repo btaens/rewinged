@@ -2,6 +2,7 @@ package models
 
 import (
     "sync"
+    "sort"
     "strings"
     "reflect"
 
@@ -188,14 +189,215 @@ func (ms *ManifestsStore) GetByKeyword (keyword string) map[string][]API_Manifes
   return manifestResultsMap
 }
 
+// nonEmpty returns the values that are not the empty string, preserving order.
+// The API version structs use it to filter the correlation identifiers
+// (ProductCode, PackageFamilyName, UpgradeCode, ...) they collect from
+// installer fields that are optional in the manifest schema.
+func nonEmpty(values []string) []string {
+    result := make([]string, 0, len(values))
+    for _, v := range values {
+        if v != "" {
+            result = append(result, v)
+        }
+    }
+    return result
+}
+
+// identifierMatches compares a search keyword against a set of correlation
+// identifiers (ProductCodes, PackageFamilyNames, UpgradeCodes).
+//
+// MatchType Exact is deliberately treated case-insensitively for these fields,
+// which fixes the installed-program correlation failures reported in
+// https://github.com/microsoft/winget-cli-restsource/issues/166: the winget
+// client builds every correlation search (winget list / post-install
+// verification) from installed-ARP values that it runs through FoldCase (see
+// CompositeSource.cpp SystemReferenceString), but sends them with MatchType
+// Exact. A literal Exact comparison can therefore never match a manifest GUID
+// written with uppercase letters. Upstream (denelon in
+// winget-cli-restsource#166) confirmed there is "no requirement for a REST
+// source to enforce a specific casing, which is why there is a Case Insensitive
+// match"; treating Exact as folded for these identifier fields is what the
+// official source's case-insensitive comparison achieves for clients that
+// cannot change their request.
+func identifierMatches(keywords []string, values []string, matchType string) bool {
+    for _, value := range values {
+        for _, keyword := range keywords {
+            switch matchType {
+            case "Exact":
+                fallthrough
+            case "CaseInsensitive":
+                if strings.EqualFold(value, keyword) {
+                    return true
+                }
+            case "StartsWith":
+                // StartsWith is implemented as case-sensitive, because it is that way in the reference implementation as well:
+                // https://github.com/microsoft/winget-cli-restsource/blob/01542050d79da0efbd11c0a5be543cb970b86eb9/src/WinGet.RestSource/Cosmos/PredicateGenerator.cs#L92-L102
+                if strings.HasPrefix(value, keyword) {
+                    return true
+                }
+            case "Substring":
+                // Substring comparison is case-insensitive, because it is that way in the reference implementation as well:
+                // https://github.com/microsoft/winget-cli-restsource/blob/01542050d79da0efbd11c0a5be543cb970b86eb9/src/WinGet.RestSource/Cosmos/PredicateGenerator.cs#L92-L102
+                if caseInsensitiveContains(value, keyword) {
+                    return true
+                }
+            default:
+                // Unimplemented match types (Wildcard, Fuzzy, FuzzySubstring)
+                // intentionally do not match: silently accepting them would
+                // report them as supported.
+            }
+        }
+    }
+    return false
+}
+
+// supportedSearchFields are the PackageMatchField values GetByMatchFilter
+// actually evaluates. Anything else is reported to the client in
+// UnsupportedPackageMatchFields instead of silently passing (see the
+// searchFilterMatches doc comment).
+//
+// Deliberately NOT in this list: Command, Tag and Market. Until this change
+// they went through findField, which looks for an exact struct field name - the
+// API structs only have the plural Commands/Tags/Markets, so findField always
+// returned an invalid reflect.Value and the field could never match. Under
+// Filters (logical AND) that silently emptied the results of any search using
+// them. The reference server implements Command/Tag against those plural
+// fields; rewinged has no getters for them yet, so they are now reported in
+// UnsupportedPackageMatchFields and ignored (the reference server likewise
+// ignores a filter it cannot translate, e.g. Market) instead of quietly
+// breaking the search. Implementing real Command/Tag matching is the proper
+// follow-up fix.
+var supportedSearchFields = map[string]bool{
+    "NormalizedPackageNameAndPublisher": true,
+    "PackageIdentifier":                 true,
+    "PackageName":                       true,
+    "Moniker":                           true,
+    "PackageFamilyName":                 true,
+    "ProductCode":                       true,
+    // UpgradeCode is not in the published v1.x request schema enum, but the
+    // reference server implements it (PredicateGenerator.GetInstallerClause:
+    // AppsAndFeaturesEntries.UpgradeCode) and current clients never send it
+    // (the CLI serializer drops the field), so this is forward support at zero
+    // cost given the getter already exists.
+    "UpgradeCode": true,
+}
+
+// normalizeReplacer strips the separators the (deliberately simple) normalized
+// name comparison ignores. Package level so the hot search loop does not
+// rebuild it per filter evaluation.
+var normalizeReplacer = strings.NewReplacer(" ", "", "-", "", "+", "")
+
+// searchFilterMatches evaluates one Inclusions/Filters entry against one
+// package version.
+//
+// Fields the server does not evaluate return (true, false) "matched but
+// unsupported". The reference implementation is lenient the same way (its
+// PredicateGenerator adds no clause for a field it cannot translate) and the
+// official client consumes the UnsupportedPackageMatchFields response key to
+// know the answer is less constrained than requested; refusing the whole
+// request over one unmatchable field would break such a search outright. The
+// unsupported flag is what makes the leniency visible to the client instead of
+// a silent pass.
+func searchFilterMatches(packageIdentifier string, packageVersion API_ManifestVersionInterface, filter API_SearchRequestPackageMatchFilter_1_1_0) (matched bool, supported bool) {
+    if !supportedSearchFields[filter.PackageMatchField] {
+        return true, false
+    }
+
+    switch filter.PackageMatchField {
+    case "NormalizedPackageNameAndPublisher":
+        // The REST search schema has only one KeyWord per match filter, so the
+        // client (SearchRequestSerializer_1_0: "normalized-pair requests send
+        // the name without the publisher") drops the publisher half of the
+        // name+publisher pair on the wire. We can therefore only ever compare
+        // against our own normalized PackageName. This is why the name+publisher
+        // correlation remains imperfect: see
+        // https://github.com/microsoft/winget-cli-restsource/issues/59
+        requestMatchValue := normalizeReplacer.Replace(strings.ToLower(packageVersion.GetDefaultLocalePackageName()))
+        return compareSearchValue(requestMatchValue, filter.RequestMatch), true
+    case "PackageIdentifier":
+        // We don't need to recursively search for this field, it's easy to get to
+        requestMatchValue := packageIdentifier
+        return compareSearchValue(requestMatchValue, filter.RequestMatch), true
+    case "PackageFamilyName":
+        // The getters replace findField here: the client's correlation search
+        // set (CompositeSource.cpp) includes ARP-entry values, which only live
+        // under AppsAndFeaturesEntries, and findField's first-match-wins scalar
+        // lookup would silently pick just one installer-level value. It also
+        // cannot resolve slice fields at all (reflect.Value.String() on a slice
+        // returns a placeholder like "<[]string Value>" that can never match).
+        return identifierMatches([]string{filter.RequestMatch.KeyWord}, packageVersion.GetInstallerPackageFamilyNames(), filter.RequestMatch.MatchType), true
+    case "ProductCode":
+        // The reference server matches installer ProductCode OR any
+        // AppsAndFeaturesEntries ProductCode (PredicateGenerator.GetInstallerClause);
+        // GetInstallerProductCodes collects both, mirroring the client's
+        // Manifest::GetProductCodes correlation set.
+        return identifierMatches([]string{filter.RequestMatch.KeyWord}, packageVersion.GetInstallerProductCodes(), filter.RequestMatch.MatchType), true
+    case "UpgradeCode":
+        return identifierMatches([]string{filter.RequestMatch.KeyWord}, packageVersion.GetInstallerUpgradeCodes(), filter.RequestMatch.MatchType), true
+    case "PackageName":
+        fallthrough
+    case "Moniker":
+        fallthrough
+    default:
+        // Just search the whole struct for a field with the right name
+        // Get the value of a nested struct field passing in the field name to search for as a string
+        // Source: https://stackoverflow.com/a/38407429
+        //
+        // findField can only resolve the first scalar string field with the
+        // exact name. The correlation identifier fields (ProductCode,
+        // PackageFamilyName, UpgradeCode) are handled above via the interface
+        // getters because the client's correlation set also includes
+        // AppsAndFeaturesEntries values, which findField's first-match-wins
+        // lookup cannot reach.
+        f := findField(packageVersion, string(filter.PackageMatchField))
+        requestMatchValue := string(f.String())
+        return compareSearchValue(requestMatchValue, filter.RequestMatch), true
+    }
+}
+
+func compareSearchValue(requestMatchValue string, match API_SearchRequestMatch_1_1_0) bool {
+    switch match.MatchType {
+    case "Exact":
+        return requestMatchValue == match.KeyWord
+    case "CaseInsensitive":
+        return strings.EqualFold(requestMatchValue, match.KeyWord)
+    case "StartsWith":
+        // StartsWith is implemented as case-sensitive, because it is that way in the reference implementation as well:
+        // https://github.com/microsoft/winget-cli-restsource/blob/01542050d79da0efbd11c0a5be543cb970b86eb9/src/WinGet.RestSource/Cosmos/PredicateGenerator.cs#L92-L102
+        return strings.HasPrefix(requestMatchValue, match.KeyWord)
+    case "Substring":
+        // Substring comparison is case-insensitive, because it is that way in the reference implementation as well:
+        // https://github.com/microsoft/winget-cli-restsource/blob/01542050d79da0efbd11c0a5be543cb970b86eb9/src/WinGet.RestSource/Cosmos/PredicateGenerator.cs#L92-L102
+        return caseInsensitiveContains(requestMatchValue, match.KeyWord)
+    default:
+        // Unimplemented match types (Wildcard, Fuzzy, FuzzySubstring)
+        // intentionally do not match: silently accepting them would report
+        // them as supported.
+        return false
+    }
+}
+
+// GetByMatchFilter returns the matching package versions, and the sorted set of
+// PackageMatchField values from the request that this server does not evaluate
+// (for reporting in UnsupportedPackageMatchFields).
 func (ms *ManifestsStore) GetByMatchFilter (
   inclusions []API_SearchRequestPackageMatchFilter_1_1_0,
   filters []API_SearchRequestPackageMatchFilter_1_1_0,
 ) (
   map[string][]API_ManifestVersionInterface,
+  []string,
 ) {
   var manifestResultsMap = make(map[string][]API_ManifestVersionInterface)
-  normalizeReplacer := strings.NewReplacer(" ", "", "-", "", "+", "")
+
+  // Report every requested match field this server does not evaluate, per
+  // request (not per version), independently of whether the inclusion loop
+  // short-circuits before reaching it.
+  unsupportedFields := make(map[string]bool)
+  for _, f := range append(append([]API_SearchRequestPackageMatchFilter_1_1_0{}, filters...), inclusions...) {
+    if !supportedSearchFields[f.PackageMatchField] {
+      unsupportedFields[f.PackageMatchField] = true
+    }
+  }
 
   ms.RLock()
   for packageIdentifier, packageVersions := range ms.internal {
@@ -209,65 +411,11 @@ func (ms *ManifestsStore) GetByMatchFilter (
 
       // process filters (if any)
       for _, filter := range filters {
-        var requestMatchValue string
-
-        switch filter.PackageMatchField {
-          case "NormalizedPackageNameAndPublisher":
-            // winget only ever sends the package / software name, the publisher isn't included so to
-            // enable proper matching we also only compare against the normalized packagename.
-            requestMatchValue = normalizeReplacer.Replace(strings.ToLower(packageVersion.GetDefaultLocalePackageName()))
-          case "PackageIdentifier":
-            // We don't need to recursively search for this field, it's easy to get to
-            requestMatchValue = packageIdentifier
-          case "PackageName":
-            fallthrough
-          case "Moniker":
-            fallthrough
-          case "Command":
-            fallthrough
-          case "Tag":
-            fallthrough
-          case "PackageFamilyName":
-            fallthrough
-          case "ProductCode":
-            fallthrough
-          case "Market":
-            fallthrough
-          default:
-            // Just search the whole struct for a field with the right name
-            // Get the value of a nested struct field passing in the field name to search for as a string
-            // Source: https://stackoverflow.com/a/38407429
-            f := findField(packageVersion, string(filter.PackageMatchField))
-            requestMatchValue = string(f.String())
-        }
-
+        matched, _ := searchFilterMatches(packageIdentifier, packageVersion, filter)
         // Because all filters (if any) must match (logical AND)
         // we just skip to the next packageversion if any did not match
-        switch filter.RequestMatch.MatchType {
-          // TODO: `winget list -s rewinged-local -q lapce` searches for the ProductCode with MatchType Exact
-          // Why does it use MatchType Exact?? Does the reference / official source normalize all ProductCodes on ingest??
-          case "Exact":
-            if requestMatchValue != filter.RequestMatch.KeyWord {
-              continue NEXT_VERSION
-            }
-          case "CaseInsensitive":
-            if !strings.EqualFold(requestMatchValue, filter.RequestMatch.KeyWord) {
-              continue NEXT_VERSION
-            }
-          case "StartsWith":
-            // StartsWith is implemented as case-sensitive, because it is that way in the reference implementation as well:
-            // https://github.com/microsoft/winget-cli-restsource/blob/01542050d79da0efbd11c0a5be543cb970b86eb9/src/WinGet.RestSource/Cosmos/PredicateGenerator.cs#L92-L102
-            if !strings.HasPrefix(requestMatchValue, filter.RequestMatch.KeyWord) {
-              continue NEXT_VERSION
-            }
-          case "Substring":
-            // Substring comparison is case-insensitive, because it is that way in the reference implementation as well:
-            // https://github.com/microsoft/winget-cli-restsource/blob/01542050d79da0efbd11c0a5be543cb970b86eb9/src/WinGet.RestSource/Cosmos/PredicateGenerator.cs#L92-L102
-            if !caseInsensitiveContains(requestMatchValue, filter.RequestMatch.KeyWord) {
-              continue NEXT_VERSION
-            }
-          default:
-            // Unimplemented: Wildcard, Fuzzy, FuzzySubstring
+        if !matched {
+          continue NEXT_VERSION
         }
       }
 
@@ -276,77 +424,15 @@ func (ms *ManifestsStore) GetByMatchFilter (
         continue NEXT_VERSION
       }
 
+      // process inclusions (if any): at least one must match (logical OR)
       var anyInclusionMatched bool
-      anyInclusionMatched = true
-      // process inclusions (if any)
       NEXT_INCLUSION:
       for _, inclusion := range inclusions {
-        var requestMatchValue string
-        anyInclusionMatched = false
-
-        switch inclusion.PackageMatchField {
-          case "NormalizedPackageNameAndPublisher":
-            // winget only ever sends the package / software name, the publisher isn't included so to
-            // enable proper matching we also only compare against the normalized packagename.
-            requestMatchValue = normalizeReplacer.Replace(strings.ToLower(packageVersion.GetDefaultLocalePackageName()))
-          case "PackageIdentifier":
-            // We don't need to recursively search for this field, it's easy to get to
-            requestMatchValue = packageIdentifier
-          case "PackageName":
-            fallthrough
-          case "Moniker":
-            fallthrough
-          case "Command":
-            fallthrough
-          case "Tag":
-            fallthrough
-          case "PackageFamilyName":
-            fallthrough
-          case "ProductCode":
-            fallthrough
-          case "Market":
-            fallthrough
-          default:
-            // Just search the whole struct for a field with the right name
-            // Get the value of a nested struct field passing in the field name to search for as a string
-            // Source: https://stackoverflow.com/a/38407429
-            f := findField(packageVersion, string(inclusion.PackageMatchField))
-            requestMatchValue = string(f.String())
-        }
-
-        switch inclusion.RequestMatch.MatchType {
-          // TODO: `winget list -s rewinged-local -q lapce` searches for the ProductCode with MatchType Exact
-          // Why does it use MatchType Exact?? Does the reference / official source normalize all ProductCodes on ingest??
-          case "Exact":
-            if requestMatchValue == inclusion.RequestMatch.KeyWord {
-              // Break out of the inclusions loop after one successful match
-              anyInclusionMatched = true
-              break NEXT_INCLUSION
-            }
-          case "CaseInsensitive":
-            if strings.EqualFold(requestMatchValue, inclusion.RequestMatch.KeyWord) {
-              // Break out of the inclusions loop after one successful match
-              anyInclusionMatched = true
-              break NEXT_INCLUSION
-            }
-          case "StartsWith":
-            // StartsWith is implemented as case-sensitive, because it is that way in the reference implementation as well:
-            // https://github.com/microsoft/winget-cli-restsource/blob/01542050d79da0efbd11c0a5be543cb970b86eb9/src/WinGet.RestSource/Cosmos/PredicateGenerator.cs#L92-L102
-            if strings.HasPrefix(requestMatchValue, inclusion.RequestMatch.KeyWord) {
-              // Break out of the inclusions loop after one successful match
-              anyInclusionMatched = true
-              break NEXT_INCLUSION
-            }
-          case "Substring":
-            // Substring comparison is case-insensitive, because it is that way in the reference implementation as well:
-            // https://github.com/microsoft/winget-cli-restsource/blob/01542050d79da0efbd11c0a5be543cb970b86eb9/src/WinGet.RestSource/Cosmos/PredicateGenerator.cs#L92-L102
-            if caseInsensitiveContains(requestMatchValue, inclusion.RequestMatch.KeyWord) {
-              // Break out of the inclusions loop after one successful match
-              anyInclusionMatched = true
-              break NEXT_INCLUSION
-            }
-          default:
-            // Unimplemented: Wildcard, Fuzzy, FuzzySubstring
+        matched, _ := searchFilterMatches(packageIdentifier, packageVersion, inclusion)
+        if matched {
+          // Break out of the inclusions loop after one successful match
+          anyInclusionMatched = true
+          break NEXT_INCLUSION
         }
       }
 
@@ -359,7 +445,17 @@ func (ms *ManifestsStore) GetByMatchFilter (
   }
   ms.RUnlock()
 
-  return manifestResultsMap
+  var unsupported []string
+  for field := range unsupportedFields {
+    unsupported = append(unsupported, field)
+  }
+  sort.Strings(unsupported)
+  if unsupported == nil {
+    // keep the JSON wire shape consistent with RequiredPackageMatchFields ([] not null)
+    unsupported = []string{}
+  }
+
+  return manifestResultsMap, unsupported
 }
 
 // This function takes two values and returns

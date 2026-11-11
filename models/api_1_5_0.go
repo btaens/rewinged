@@ -40,9 +40,54 @@ func (ver API_ManifestVersion_1_5_0) GetInstallerProductCodes() []string {
 
     for _, installer := range ver.Installers {
       productCodes = append(productCodes, installer.ProductCode)
+      for _, afe := range installer.AppsAndFeaturesEntries {
+        productCodes = append(productCodes, afe.ProductCode)
+      }
     }
 
-    return productCodes
+    return nonEmpty(productCodes)
+}
+
+func (ver API_ManifestVersion_1_5_0) GetInstallerPackageFamilyNames() []string {
+    var packageFamilyNames []string
+
+    for _, installer := range ver.Installers {
+      packageFamilyNames = append(packageFamilyNames, installer.PackageFamilyName)
+    }
+
+    return nonEmpty(packageFamilyNames)
+}
+
+// GetInstallerUpgradeCodes returns the UpgradeCode of every installer's
+// AppsAndFeaturesEntries. The winget client builds its installed-package
+// correlation set from exactly this (Manifest::GetUpgradeCodes only reads the
+// ARP entries), and search responses from API 1.4.0 on feed it back via the
+// UpgradeCodes field.
+func (ver API_ManifestVersion_1_5_0) GetInstallerUpgradeCodes() []string {
+    var upgradeCodes []string
+
+    for _, installer := range ver.Installers {
+      for _, afe := range installer.AppsAndFeaturesEntries {
+        upgradeCodes = append(upgradeCodes, afe.UpgradeCode)
+      }
+    }
+
+    return nonEmpty(upgradeCodes)
+}
+
+// GetAppsAndFeaturesEntryVersions returns the DisplayVersion of every
+// installer's AppsAndFeaturesEntries, i.e. the ARP version string the client
+// compares installed software versions against.
+func (ver API_ManifestVersion_1_5_0) GetAppsAndFeaturesEntryVersions() []string {
+    var arpVersions []string
+
+    for _, installer := range ver.Installers {
+      for _, afe := range installer.AppsAndFeaturesEntries {
+        arpVersions = append(arpVersions, afe.DisplayVersion)
+      }
+    }
+
+    return nonEmpty(arpVersions)
 }
 
 func (ver API_ManifestVersion_1_5_0) GetDefaultLocale() API_DefaultLocaleInterface {
@@ -222,7 +267,7 @@ type API_ManifestSearchVersion_1_5_0 struct {
     Channel string //maxlength: 16, unused
     PackageFamilyNames []string
     ProductCodes []string
-    AppsAndFeaturesEntryVersions string
+    AppsAndFeaturesEntryVersions []string // WinGet-1.5.0.yaml: array of AppsAndFeaturesEntryVersion
     UpgradeCodes []string
 }
 

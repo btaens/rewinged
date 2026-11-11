@@ -17,7 +17,7 @@ It is currently in [pre-1.0](https://semver.org/#spec-item-4) development so con
 
 ## 🚧 Not Yet Working or Complete
 
-- Correlation of installed programs and programs in the repository is not perfect (in part due to [this](https://github.com/microsoft/winget-cli-restsource/issues/59) and [this](https://github.com/microsoft/winget-cli-restsource/issues/166))
+- Matching a package by its name and publisher (rather than by ProductCode/UpgradeCode/PackageFamilyName) is still imperfect, because the REST search schema has no field for the publisher half of that pair ([this](https://github.com/microsoft/winget-cli-restsource/issues/59)).
 - Manifest version 1.28.0 adds the optional `DesiredStateConfiguration` field to installer and singleton manifests. rewinged accepts manifests that contain it, but does not serve that data, because no published winget REST API schema (the newest is 1.10.0) has a field for it.
 - All manifest files of one package must declare the same `ManifestVersion`. Files are grouped into a package by `PackageIdentifier` + `PackageVersion` + `ManifestVersion`, so bumping only the installer manifest to 1.28.0 while leaving the version and locale manifests on an older version makes the whole package fail to load. Bump all of a package's files together.
 - Live reload of manifests (works for new and changed manifests, but removals are only picked up on restart)

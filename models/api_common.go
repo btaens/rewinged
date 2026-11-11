@@ -30,7 +30,14 @@ type API_ManifestVersionInterface interface {
     GetDefaultLocale() API_DefaultLocaleInterface
     GetLocales() []API_LocaleInterface
     GetInstallers() []API_InstallerInterface
+    // GetInstallerProductCodes returns the ProductCode of every installer plus
+    // the ProductCode of every AppsAndFeaturesEntry, empty values filtered.
+    // This mirrors the winget client's Manifest::GetProductCodes(), which is
+    // what it builds its installed-package correlation searches from.
     GetInstallerProductCodes() []string
+    GetInstallerPackageFamilyNames() []string
+    GetInstallerUpgradeCodes() []string
+    GetAppsAndFeaturesEntryVersions() []string
 }
 
 type API_InstallerInterface interface {
