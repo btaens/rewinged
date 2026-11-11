@@ -288,3 +288,103 @@ func TestSearchResponseWireShape(t *testing.T) {
 		}
 	}
 }
+
+// The NormalizedPackageNameAndPublisher keyword is what makes `winget list`
+// show a newer version at all. CompositeSource.cpp sends the correlation pair
+// alongside the ARP ProductCode; the client's NameNormalization strips every
+// character outside [\p{L}\p{Nd}] from the manifest name, so a name containing
+// punctuation ("draw.io") arrives as "drawio". Comparing the raw manifest name
+// against that keyword matches nothing, the ProductCode inclusion then matches
+// only the single installed version (wix GUIDs change per version), and the
+// client's latest-of-the-returned-versions is the installed one - so no
+// "Available" upgrade is displayed.
+//
+// Keywords below are copied from a live winget 1.29.380 correlation request.
+func normalizedPairStore(t *testing.T) *ManifestsStore {
+	t.Helper()
+	ms := &ManifestsStore{}
+	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)
+
+	for _, tc := range []struct{ version, productCode string }{
+		{"31.4.5", "{48AA8CF8-AC09-4435-AA45-43FFDFE27194}"},
+		{"31.5.2", "{760E4075-E6CF-465E-82F4-6D727ADAD52D}"},
+		{"32.6.10", "{CD86C383-8B30-45BF-B556-3842870F3295}"},
+	} {
+		ms.Set("JGraph.Draw", tc.version, &API_ManifestVersion_1_10_0{
+			PackageVersion: tc.version,
+			DefaultLocale: API_DefaultLocale_1_10_0{
+				PackageName:      "draw.io",
+				Publisher:        "JGraph",
+				ShortDescription: "diagramming tool",
+			},
+			Installers: []API_Installer_1_10_0{{ProductCode: tc.productCode}},
+		})
+	}
+	return ms
+}
+
+func TestNormalizedPackageNamePublisherMatchesPunctuatedName(t *testing.T) {
+	ms := normalizedPairStore(t)
+
+	// Exactly the inclusion the client sends for an installed draw.io.
+	res, unsupported := ms.GetByMatchFilter(
+		[]API_SearchRequestPackageMatchFilter_1_1_0{
+			{PackageMatchField: "ProductCode", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "{48aa8cf8-ac09-4435-aa45-43ffdfe27194}"}},
+			{PackageMatchField: "NormalizedPackageNameAndPublisher", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "drawio"}},
+		},
+		nil,
+	)
+	if len(unsupported) != 0 {
+		t.Errorf("unsupported fields = %v, want none", unsupported)
+	}
+	if len(res) != 1 {
+		t.Fatalf("pair inclusion matched %d packages, want 1", len(res))
+	}
+	// The pair must carry every version, not just the installed one: that is
+	// what lets the client report a newer Available version.
+	if got := len(res["JGraph.Draw"]); got != 3 {
+		t.Errorf("pair inclusion returned %d versions, want all 3", got)
+	}
+
+	// The pair alone (no ProductCode hit) must also match.
+	res, _ = ms.GetByMatchFilter(
+		[]API_SearchRequestPackageMatchFilter_1_1_0{
+			{PackageMatchField: "NormalizedPackageNameAndPublisher", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "drawio"}},
+		},
+		nil,
+	)
+	if got := len(res["JGraph.Draw"]); got != 3 {
+		t.Errorf("pair alone matched %d versions, want 3", got)
+	}
+
+	// A different name must still not match.
+	res, _ = ms.GetByMatchFilter(
+		[]API_SearchRequestPackageMatchFilter_1_1_0{
+			{PackageMatchField: "NormalizedPackageNameAndPublisher", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "firefox"}},
+		},
+		nil,
+	)
+	if len(res) != 0 {
+		t.Errorf("foreign normalized name matched %d packages, want 0", len(res))
+	}
+}
+
+func TestNormalizePackageNameCharacterClass(t *testing.T) {
+	// The client keeps Unicode letters and digits and removes everything else;
+	// the accented case is from the same live log (a Hungarian ARP display name
+	// arrives with á/ő intact), so an ASCII-only filter would break it.
+	for _, tc := range []struct{ in, want string }{
+		{"draw.io", "drawio"},
+		{"Mozilla Firefox", "mozillafirefox"},
+		{"7-Zip", "7zip"},
+		{"WinSSH-Pageant", "winsshpageant"},
+		{"Intel(R) Graphics Software & Drivers", "intelgraphicssoftwaredrivers"},
+		{"Microsoft PC állapotellenőrzés", "microsoftpcállapotellenőrzés"},
+		{"C++ Builder", "cbuilder"},
+		{"Éditeur #1", "éditeur1"},
+	} {
+		if got := normalizePackageName(tc.in); got != tc.want {
+			t.Errorf("normalizePackageName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

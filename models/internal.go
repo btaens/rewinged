@@ -1,10 +1,12 @@
 package models
 
 import (
+    "regexp"
     "sync"
     "sort"
     "strings"
     "reflect"
+    "unicode"
 
     "rewinged/logging"
 
@@ -282,10 +284,51 @@ var supportedSearchFields = map[string]bool{
     "UpgradeCode": true,
 }
 
-// normalizeReplacer strips the separators the (deliberately simple) normalized
-// name comparison ignores. Package level so the hot search loop does not
-// rebuild it per filter evaluation.
-var normalizeReplacer = strings.NewReplacer(" ", "", "-", "", "+", "")
+// normalizePackageName reduces a package name to the form the winget client
+// puts in the wire KeyWord for NormalizedPackageNameAndPublisher inclusions.
+//
+// The client (winget-cli NameNormalization.cpp, NormalizationInitial) removes
+// architecture/locale/version tokens, then splits on everything outside
+// [\p{L}\p{Nd}\+&] and finally removes every character that is not a Unicode
+// letter or digit (Remove(NonLettersAndDigits)). The surviving character class
+// is what the wire keyword contains; verified from a live correlation request:
+// manifest name "draw.io" arrives as KeyWord "drawio", and
+// "Microsoft PC 状态检查" style non-ASCII names arrive with their accented
+// letters intact (e.g. "windowspcállapotellenőrzés"), so the filter must be
+// Unicode-aware, not ASCII-only.
+//
+// The bracket-enclosed removal mirrors the client's NonNestedBracket/
+// BracketEnclosed stages, which run repeatedly until stable: "(R)", "(x86)"
+// and "[Preview]" groups are dropped entirely, not just their brackets. The
+// live-log Intel entry confirms it: ARP name "Intel(R) Graphics Software &
+// Drivers" arrives as KeyWord "intelgraphicssoftwaredrivers", without the R.
+//
+// Known gap versus full parity: the client additionally strips standalone
+// architecture/locale/version tokens before joining ("7-Zip (x64)" -> "7zip").
+// The bracketed forms are already covered by the bracket pass; bare ones
+// ("Mozilla Firefox 159.0" -> "mozillafirefox") only matter when a manifest
+// name itself carries a version token the ARP keyword lacks, which does not
+// occur in practice. The ICU regex port stays deferred.
+var bracketEnclosedRe = regexp.MustCompile(`\([^()]*\)|\[[^\[\]]*\]|"[^"]*"`)
+
+func normalizePackageName(name string) string {
+    lower := strings.ToLower(name)
+    for {
+        next := bracketEnclosedRe.ReplaceAllString(lower, "")
+        if next == lower {
+            break
+        }
+        lower = next
+    }
+    var b strings.Builder
+    b.Grow(len(lower))
+    for _, r := range lower {
+        if unicode.IsLetter(r) || unicode.IsDigit(r) {
+            b.WriteRune(r)
+        }
+    }
+    return b.String()
+}
 
 // searchFilterMatches evaluates one Inclusions/Filters entry against one
 // package version.
@@ -312,8 +355,15 @@ func searchFilterMatches(packageIdentifier string, packageVersion API_ManifestVe
         // against our own normalized PackageName. This is why the name+publisher
         // correlation remains imperfect: see
         // https://github.com/microsoft/winget-cli-restsource/issues/59
-        requestMatchValue := normalizeReplacer.Replace(strings.ToLower(packageVersion.GetDefaultLocalePackageName()))
-        return compareSearchValue(requestMatchValue, filter.RequestMatch), true
+        //
+        // Both sides go through normalizePackageName: our value because the
+        // manifest stores the raw name, the keyword because a client-side
+        // normalization change must not silently break Exact matching here.
+        // The client sends this inclusion with MatchType Exact.
+        normalized := normalizePackageName(packageVersion.GetDefaultLocalePackageName())
+        normalizedFilter := filter
+        normalizedFilter.RequestMatch.KeyWord = normalizePackageName(filter.RequestMatch.KeyWord)
+        return compareSearchValue(normalized, normalizedFilter.RequestMatch), true
     case "PackageIdentifier":
         // We don't need to recursively search for this field, it's easy to get to
         requestMatchValue := packageIdentifier
