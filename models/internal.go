@@ -284,6 +284,15 @@ var supportedSearchFields = map[string]bool{
     "UpgradeCode": true,
 }
 
+// strongMatchFields mirror the client's IsStrongMatchField (CompositeSource.cpp):
+// fields that carry a definitive (non-heuristic) correlation signal. Used only
+// for correlation disambiguation in GetByMatchFilter (see there).
+var strongMatchFields = map[string]bool{
+    "PackageFamilyName": true,
+    "ProductCode":       true,
+    "UpgradeCode":       true,
+}
+
 // normalizePackageName reduces a package name to the form the winget client
 // puts in the wire KeyWord for NormalizedPackageNameAndPublisher inclusions.
 //
@@ -481,6 +490,9 @@ func (ms *ManifestsStore) GetByMatchFilter (
   []string,
 ) {
   var manifestResultsMap = make(map[string][]API_ManifestVersionInterface)
+  // packageStrong records packages reached through a strong identifier field
+  // (see strongMatchFields), used for the correlation disambiguation below.
+  packageStrong := make(map[string]bool)
 
   // Report every requested match field this server does not evaluate, per
   // request (not per version), independently of whether the inclusion loop
@@ -498,6 +510,11 @@ func (ms *ManifestsStore) GetByMatchFilter (
     // ProductCode, PackageName etc. can change between versions.
     NEXT_VERSION:
     for _, packageVersion := range packageVersions {
+      // versionStrong is set when this version is matched directly by a strong
+      // identifier field (PFN/ProductCode/UpgradeCode), not only by a heuristic
+      // field such as the normalized name pair.
+      versionStrong := false
+
       // From what I can gather from https://github.com/microsoft/winget-cli-restsource/blob/01542050d79da0efbd11c0a5be543cb970b86eb9/src/WinGet.RestSource/Cosmos/CosmosDataStore.cs#L452
       // the difference between inclusions and filters are that inclusions are evaluated with a logical OR (only one of them has to match) and filters are evaluated with a logical AND
       // (all filter specified have to match) - so this is what I implemented here. But I am not 100% sure this is the correct/intended use for inclusions vs. filters.
@@ -510,22 +527,30 @@ func (ms *ManifestsStore) GetByMatchFilter (
         if !matched {
           continue NEXT_VERSION
         }
+        if strongMatchFields[filter.PackageMatchField] {
+          versionStrong = true
+        }
       }
 
       if len(inclusions) == 0 {
         manifestResultsMap[packageIdentifier] = append(manifestResultsMap[packageIdentifier], packageVersion)
+        if versionStrong {
+          packageStrong[packageIdentifier] = true
+        }
         continue NEXT_VERSION
       }
 
-      // process inclusions (if any): at least one must match (logical OR)
+      // process inclusions (if any): at least one must match (logical OR).
+      // Every inclusion is evaluated (no early break) so a strong field later in
+      // the list is still seen even when a weak field already satisfied the OR.
       var anyInclusionMatched bool
-      NEXT_INCLUSION:
       for _, inclusion := range inclusions {
         matched, _ := searchFilterMatches(packageIdentifier, packageVersion, inclusion)
         if matched {
-          // Break out of the inclusions loop after one successful match
           anyInclusionMatched = true
-          break NEXT_INCLUSION
+          if strongMatchFields[inclusion.PackageMatchField] {
+            versionStrong = true
+          }
         }
       }
 
@@ -533,10 +558,67 @@ func (ms *ManifestsStore) GetByMatchFilter (
       if anyInclusionMatched {
         logging.Logger.Debug().Msgf("adding to the results map: %v version %v", packageIdentifier, packageVersion.GetPackageVersion())
         manifestResultsMap[packageIdentifier] = append(manifestResultsMap[packageIdentifier], packageVersion)
+        if versionStrong {
+          packageStrong[packageIdentifier] = true
+        }
       }
     }
   }
   ms.RUnlock()
+
+  // Correlation disambiguation. The reference client keeps a multi-package
+  // correlation response only when exactly one package matched on a strong
+  // identifier field (CompositeSource.cpp: GetMatchingPackage ->
+  // FindOnlyStrongMatchFieldResult, IsStrongMatchField = PFN/ProductCode/
+  // UpgradeCode); otherwise it logs "Appropriate available package could not be
+  // determined" and drops the whole result, which makes the installed app
+  // disappear from `winget list` entirely. Crucially the client derives match
+  // strength from Query/Filters only, never Inclusions (MatchCriteriaResolver.
+  // cpp: GetBestMatchType), so on a REST source every correlation match arrives
+  // with Unknown criteria and a multi-package response is always rejected - the
+  // server must hand back a single package for correlation to work at all.
+  //
+  // NormalizedPackageNameAndPublisher is a heuristic field, and several distinct
+  // packages share one normalized name in the community repo: "Microsoft .NET SDK
+  // 8.0"/"9.0"/"10.0" all normalize to "microsoftnetsdk" (version tokens are
+  // stripped, as the client does), and "Mozilla Firefox"/"(hu)"/"(de)"/"(MSIX)"
+  // all collapse to "mozillafirefox" (bracket groups are dropped, as the client
+  // does). The client cannot use that name to choose between them, so when the
+  // fan-out leaves exactly one package that is also reached through a strong
+  // identifier - the installed app's own wix ProductCode, a PackageFamilyName or
+  // an UpgradeCode - we keep only that package, with all of its versions, so
+  // upgrades still resolve. That is the decision FindOnlyStrongMatchFieldResult
+  // makes once it can see the strength at all.
+  //
+  // When no package has a strong anchor the ambiguity is real and the result is
+  // returned unchanged rather than guessed: nothing in the wire request
+  // distinguishes "Microsoft .NET SDK 9.0" from "8.0" once both normalize to the
+  // same keyword, and picking one would be a guess the client has no way to
+  // confirm.
+  //
+  // This only collapses genuinely mixed-strength results. A search whose every
+  // package matched through a strong field (e.g. Filters on ProductCode, which is
+  // logical AND) has more than one strong package and is left intact.
+  //
+  // Cost, stated: the REST search request carries no search purpose, so this
+  // cannot tell a correlation search apart from a user-issued multi-criteria
+  // search that OR-es a strong identifier with a name (e.g. --product-code plus a
+  // name criterion). Such a search gets narrowed to the strong-anchored package.
+  // Correlation is the load-bearing case - it decides whether an installed app
+  // appears in `winget list` at all - and plain `winget search` goes through
+  // Query/GetByKeyword, which this does not touch.
+  if len(manifestResultsMap) > 1 {
+    var strongIdentifiers []string
+    for identifier := range manifestResultsMap {
+      if packageStrong[identifier] {
+        strongIdentifiers = append(strongIdentifiers, identifier)
+      }
+    }
+    if len(strongIdentifiers) == 1 {
+      logging.Logger.Debug().Msgf("correlation disambiguation: %v package(s) matched, keeping the single strong-identifier match %v", len(manifestResultsMap), strongIdentifiers[0])
+      manifestResultsMap = map[string][]API_ManifestVersionInterface{strongIdentifiers[0]: manifestResultsMap[strongIdentifiers[0]]}
+    }
+  }
 
   var unsupported []string
   for field := range unsupportedFields {

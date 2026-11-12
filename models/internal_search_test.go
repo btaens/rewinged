@@ -391,6 +391,12 @@ func TestNormalizePackageNameCharacterClass(t *testing.T) {
 		{"C++ Builder", "cbuilder"},
 		{"Éditeur #1", "éditeur1"},
 		{"Some App (KB5034441)", "someappkb5034441"},
+		// Locale/channel variants collapse onto the base name. These are the
+		// collisions that make one correlation search return several packages, so
+		// they are pinned deliberately: the collapse in GetByMatchFilter, not the
+		// normalizer, is where they get resolved.
+		{"Mozilla Firefox (hu)", "mozillafirefox"},
+		{"Microsoft .NET SDK 10.0", "microsoftnetsdk"},
 	} {
 		if got := normalizePackageName(tc.in); got != tc.want {
 			t.Errorf("normalizePackageName(%q) = %q, want %q", tc.in, got, tc.want)
@@ -433,5 +439,150 @@ func TestSDKStyleVersionTokenInNameStillCorrelates(t *testing.T) {
 	)
 	if got := len(res["Microsoft.DotNet.SDK.8"]); got != 2 {
 		t.Errorf("SDK correlation returned %d versions, want both 2 (so 8.0.428 shows as Available)", got)
+	}
+	if got := len(res); got != 1 {
+		t.Errorf("SDK correlation matched %d packages, want 1", got)
+	}
+}
+
+// sdkFamilyStore reproduces the community repo at scale: every .NET SDK major is
+// a separate PackageIdentifier whose PackageName carries a version token, so
+// once normalizePackageName strips tokens the way the client does, all of them
+// normalize to the identical keyword "microsoftnetsdk".
+func sdkFamilyStore(t *testing.T) *ManifestsStore {
+	t.Helper()
+	ms := &ManifestsStore{}
+	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)
+
+	for _, tc := range []struct{ id, version, name, productCode string }{
+		{"Microsoft.DotNet.SDK.8", "8.0.425", "Microsoft .NET SDK 8.0", "{AB39B1D0-4847-4C0D-A1C1-B2BE697F2B76}"},
+		{"Microsoft.DotNet.SDK.8", "8.0.428", "Microsoft .NET SDK 8.0", "{D76560AF-3660-42AF-8CEB-47FC58A70915}"},
+		{"Microsoft.DotNet.SDK.9", "9.0.100", "Microsoft .NET SDK 9.0", "{40819C02-3BD5-4E8B-9C10-101EF13DE6A1}"},
+		{"Microsoft.DotNet.SDK.10", "10.0.100", "Microsoft .NET SDK 10.0", "{0898FFD1-9871-4809-B4F9-09608F700177}"},
+	} {
+		ms.Set(tc.id, tc.version, &API_ManifestVersion_1_10_0{
+			PackageVersion: tc.version,
+			DefaultLocale: API_DefaultLocale_1_10_0{
+				PackageName:      tc.name,
+				Publisher:        "Microsoft Corporation",
+				ShortDescription: ".NET SDK",
+			},
+			Installers: []API_Installer_1_10_0{{ProductCode: tc.productCode}},
+		})
+	}
+	return ms
+}
+
+// The version-token strip that makes SDK.8 correlate at all also makes the
+// normalized-pair inclusion match every SDK major, so a correlation search
+// returns several packages. The client (CompositeSource.cpp:
+// GetMatchingPackage -> FindOnlyStrongMatchFieldResult) keeps such a response
+// only when exactly one package matched on a strong identifier, and on a REST
+// source it cannot even see which one did (MatchCriteriaResolver.cpp:
+// GetBestMatchType reads Query/Filters only, never Inclusions), so a
+// multi-package correlation response is discarded outright and the installed
+// app vanishes from `winget list`. The server therefore has to hand back the one
+// package the strong anchor identifies.
+func TestCorrelationCollapsesSdkSiblingsOntoStrongAnchor(t *testing.T) {
+	ms := sdkFamilyStore(t)
+
+	// First check the premise: without a strong anchor the name pair alone fans
+	// out over every SDK major.
+	res, _ := ms.GetByMatchFilter(
+		[]API_SearchRequestPackageMatchFilter_1_1_0{
+			{PackageMatchField: "NormalizedPackageNameAndPublisher", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "microsoftnetsdk"}},
+		},
+		nil,
+	)
+	if got := len(res); got != 3 {
+		t.Fatalf("name pair alone matched %d packages, want 3 (fixture premise)", got)
+	}
+
+	// Exact wire body for an installed SDK 8.0.425: its own wix ProductCode plus
+	// the two normalized-pair variants.
+	res, _ = ms.GetByMatchFilter(
+		[]API_SearchRequestPackageMatchFilter_1_1_0{
+			{PackageMatchField: "ProductCode", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "{ab39b1d0-4847-4c0d-a1c1-b2be697f2b76}"}},
+			{PackageMatchField: "NormalizedPackageNameAndPublisher", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "microsoftnetsdk"}},
+			{PackageMatchField: "NormalizedPackageNameAndPublisher", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "microsoftnetsdk(x64)"}},
+		},
+		nil,
+	)
+	if got := len(res); got != 1 {
+		t.Fatalf("SDK correlation returned %d packages, want the 1 strong-anchored one: %v", got, res)
+	}
+	// Collapsing must not cost versions: 8.0.428 is what makes Available show up.
+	if got := len(res["Microsoft.DotNet.SDK.8"]); got != 2 {
+		t.Errorf("collapsed SDK.8 returned %d versions, want both 2", got)
+	}
+}
+
+// firefoxFamilyStore reproduces the other scale effect: the community repo keeps
+// one package per locale/channel variant, and because normalizePackageName drops
+// bracket-enclosed groups (as the client does) "Mozilla Firefox", "(hu)",
+// "(de)" and "(MSIX)" all collapse to "mozillafirefox". None of them declares
+// the version-qualified wix ProductCode the installed app reports, so there is
+// no strong anchor to disambiguate by.
+func firefoxFamilyStore(t *testing.T) *ManifestsStore {
+	t.Helper()
+	ms := &ManifestsStore{}
+	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)
+
+	for _, tc := range []struct{ id, version, name string }{
+		{"Mozilla.Firefox", "159.0", "Mozilla Firefox (en-US)"},
+		{"Mozilla.Firefox.hu", "159.0", "Mozilla Firefox (hu)"},
+		{"Mozilla.Firefox.de", "160.0", "Mozilla Firefox (de)"},
+		{"Mozilla.Firefox.MSIX", "159.0", "Mozilla Firefox (MSIX)"},
+	} {
+		ms.Set(tc.id, tc.version, &API_ManifestVersion_1_10_0{
+			PackageVersion: tc.version,
+			DefaultLocale: API_DefaultLocale_1_10_0{
+				PackageName:      tc.name,
+				Publisher:        "Mozilla",
+				ShortDescription: "web browser",
+			},
+			// Real Firefox manifests declare the bare string as ProductCode,
+			// which can never equal the wix keyword the client sends.
+			Installers: []API_Installer_1_10_0{{ProductCode: "Mozilla Firefox"}},
+		})
+	}
+	return ms
+}
+
+// With no strong anchor the server must NOT guess a winner: nothing on the wire
+// distinguishes the variants, and silently picking one would serve upgrade
+// metadata for a package the user did not install.
+func TestCorrelationWithoutStrongAnchorDoesNotGuess(t *testing.T) {
+	ms := firefoxFamilyStore(t)
+
+	// Exact wire body for an installed Firefox 159.0 (x64 en-US).
+	res, _ := ms.GetByMatchFilter(
+		[]API_SearchRequestPackageMatchFilter_1_1_0{
+			{PackageMatchField: "ProductCode", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "mozilla firefox 159.0 (x64 en-us)"}},
+			{PackageMatchField: "NormalizedPackageNameAndPublisher", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "mozillafirefox"}},
+			{PackageMatchField: "NormalizedPackageNameAndPublisher", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "mozillafirefox(x64)"}},
+		},
+		nil,
+	)
+	if got := len(res); got != 4 {
+		t.Errorf("Firefox correlation returned %d packages, want all 4 left unresolved rather than guessed: %v", got, res)
+	}
+}
+
+// The collapse must stay scoped to genuinely mixed-strength results. When more
+// than one package is reached through a strong identifier the ambiguity is the
+// client's to resolve and the server has no basis to drop either.
+func TestCorrelationDoesNotCollapseMultipleStrongMatches(t *testing.T) {
+	ms := sdkFamilyStore(t)
+
+	res, _ := ms.GetByMatchFilter(
+		[]API_SearchRequestPackageMatchFilter_1_1_0{
+			{PackageMatchField: "ProductCode", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "{ab39b1d0-4847-4c0d-a1c1-b2be697f2b76}"}},
+			{PackageMatchField: "ProductCode", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "{40819c02-3bd5-4e8b-9c10-101ef13de6a1}"}},
+		},
+		nil,
+	)
+	if got := len(res); got != 2 {
+		t.Errorf("two strong ProductCode inclusions returned %d packages, want both 2: %v", got, res)
 	}
 }
