@@ -479,6 +479,67 @@ func compareSearchValue(requestMatchValue string, match API_SearchRequestMatch_1
     }
 }
 
+// archLocaleTokenRe admits only tokens that plausibly denote an architecture
+// or a locale code ("x64", "arm64", "msix", "hu", "en-US"). It deliberately
+// rejects bracket groups that carry other content - "(R)", "(KB5034441)",
+// "(2024)" - so a tie-break can never fire on arbitrary name decoration. The
+// pattern mirrors the token families the client's NameNormalization.cpp removes
+// (RemoveArchitecture/RemoveLocale), so tokens matching here are exactly the
+// ones the client treats as arch/locale metadata.
+var archLocaleTokenRe = regexp.MustCompile(`^(?:[a-z]{2,3}(?:-[a-z]{2,4})?|x86|x64|arm64?|msix)$`)
+
+// bracketTokens extracts the arch/locale tokens from the bracket-enclosed
+// groups of a raw (non-normalized) string: "mozilla firefox 159.0.1 (x64 en-us)"
+// yields {x64, en-us}, "Mozilla Firefox (hu)" yields {hu}, and
+// "Microsoft .NET SDK 8.0" yields {}.
+func bracketTokens(raw string) map[string]bool {
+  tokens := map[string]bool{}
+  for _, group := range bracketEnclosedRe.FindAllString(raw, -1) {
+    for _, token := range strings.Fields(group[1:len(group)-1]) {
+      token = strings.ToLower(token)
+      if archLocaleTokenRe.MatchString(token) {
+        tokens[token] = true
+      }
+    }
+  }
+  return tokens
+}
+
+// localeTokenTieBreak resolves a no-strong-anchor correlation fan-out when the
+// request's bracketed arch/locale tokens (from the raw ARP/ProductCode keyword
+// and pair keywords, before normalization strips them) intersect exactly one
+// candidate package's own default-locale name tokens. Returns the winner's
+// identifier, or "" when the ambiguity is not resolvable this way.
+func localeTokenTieBreak(results map[string][]API_ManifestVersionInterface, requestFilters []API_SearchRequestPackageMatchFilter_1_1_0) string {
+  requestTokens := map[string]bool{}
+  for _, f := range requestFilters {
+    for token := range bracketTokens(f.RequestMatch.KeyWord) {
+      requestTokens[token] = true
+    }
+  }
+  if len(requestTokens) == 0 {
+    return ""
+  }
+
+  var winner string
+  winners := 0
+  for identifier, packageVersions := range results {
+    // GetDefaultLocalePackageName is the raw name, bracket groups included -
+    // the same value the search response serializes as PackageName.
+    for token := range bracketTokens(packageVersions[0].GetDefaultLocalePackageName()) {
+      if requestTokens[token] {
+        winner = identifier
+        winners++
+        break
+      }
+    }
+  }
+  if winners == 1 {
+    return winner
+  }
+  return ""
+}
+
 // GetByMatchFilter returns the matching package versions, and the sorted set of
 // PackageMatchField values from the request that this server does not evaluate
 // (for reporting in UnsupportedPackageMatchFields).
@@ -590,11 +651,18 @@ func (ms *ManifestsStore) GetByMatchFilter (
   // upgrades still resolve. That is the decision FindOnlyStrongMatchFieldResult
   // makes once it can see the strength at all.
   //
-  // When no package has a strong anchor the ambiguity is real and the result is
-  // returned unchanged rather than guessed: nothing in the wire request
-  // distinguishes "Microsoft .NET SDK 9.0" from "8.0" once both normalize to the
-  // same keyword, and picking one would be a guess the client has no way to
-  // confirm.
+  // When no package has a strong anchor, one signal on the wire can still
+  // identify the installed variant: the ARP keyword itself carries architecture
+  // and locale tokens in brackets ("mozilla firefox 159.0.1 (x64 en-us)"), and
+  // community-repo locale siblings carry the same kind of token in their own
+  // default-locale name ("Mozilla Firefox (hu)", "(MSIX)"). Exactly one
+  // candidate whose name tokens intersect the request tokens wins (this is how
+  // the official winget source lands on the base package for an en-US install);
+  // if no token or several candidates match, the ambiguity is real and the
+  // result is returned unchanged rather than guessed: nothing else on the wire
+  // distinguishes "Microsoft .NET SDK 9.0" from "8.0" once both normalize to
+  // the same keyword, and picking one would be a guess the client has no way
+  // to confirm.
   //
   // This only collapses genuinely mixed-strength results. A search whose every
   // package matched through a strong field (e.g. Filters on ProductCode, which is
@@ -614,9 +682,17 @@ func (ms *ManifestsStore) GetByMatchFilter (
         strongIdentifiers = append(strongIdentifiers, identifier)
       }
     }
-    if len(strongIdentifiers) == 1 {
+
+    switch {
+    case len(strongIdentifiers) == 1:
       logging.Logger.Debug().Msgf("correlation disambiguation: %v package(s) matched, keeping the single strong-identifier match %v", len(manifestResultsMap), strongIdentifiers[0])
       manifestResultsMap = map[string][]API_ManifestVersionInterface{strongIdentifiers[0]: manifestResultsMap[strongIdentifiers[0]]}
+
+    case len(strongIdentifiers) == 0:
+      if tie := localeTokenTieBreak(manifestResultsMap, append(append([]API_SearchRequestPackageMatchFilter_1_1_0{}, inclusions...), filters...)); tie != "" {
+        logging.Logger.Debug().Msgf("correlation disambiguation: %v package(s) matched with no strong anchor, keeping %v on the unique architecture/locale token", len(manifestResultsMap), tie)
+        manifestResultsMap = map[string][]API_ManifestVersionInterface{tie: manifestResultsMap[tie]}
+      }
     }
   }
 

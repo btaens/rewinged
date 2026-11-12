@@ -529,7 +529,7 @@ func firefoxFamilyStore(t *testing.T) *ManifestsStore {
 	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)
 
 	for _, tc := range []struct{ id, version, name string }{
-		{"Mozilla.Firefox", "159.0", "Mozilla Firefox (en-US)"},
+		{"Mozilla.Firefox", "159.0.1", "Mozilla Firefox (en-US)"},
 		{"Mozilla.Firefox.hu", "159.0", "Mozilla Firefox (hu)"},
 		{"Mozilla.Firefox.de", "160.0", "Mozilla Firefox (de)"},
 		{"Mozilla.Firefox.MSIX", "159.0", "Mozilla Firefox (MSIX)"},
@@ -549,23 +549,50 @@ func firefoxFamilyStore(t *testing.T) *ManifestsStore {
 	return ms
 }
 
-// With no strong anchor the server must NOT guess a winner: nothing on the wire
-// distinguishes the variants, and silently picking one would serve upgrade
-// metadata for a package the user did not install.
-func TestCorrelationWithoutStrongAnchorDoesNotGuess(t *testing.T) {
+// Firefox's manifests declare no ProductCode matching the ARP keyword (a bare
+// "Mozilla Firefox" string, not the version-qualified wix key), so the locale
+// fan-out has no strong anchor. The live 2026-11-12 log shows the client walking
+// ~100 Mozilla.Firefox.* siblings and logging "Appropriate available package
+// could not be determined" - a multi-package response without a single strong
+// match is discarded and Firefox vanishes from `winget list`. The ARP keyword's
+// bracketed arch/locale tokens ("(x64 en-us)") still identify the installed
+// variant against the siblings' own default-locale names ("(en-US)", "(hu)"),
+// so exactly one candidate wins - matching how the official winget source
+// correlates the install to the base package.
+func TestCorrelationResolvesLocaleFanOutViaArchLocaleToken(t *testing.T) {
 	ms := firefoxFamilyStore(t)
 
-	// Exact wire body for an installed Firefox 159.0 (x64 en-US).
+	// Exact wire body from the live log for the installed Firefox 159.0.1 (x64 en-US).
 	res, _ := ms.GetByMatchFilter(
 		[]API_SearchRequestPackageMatchFilter_1_1_0{
-			{PackageMatchField: "ProductCode", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "mozilla firefox 159.0 (x64 en-us)"}},
+			{PackageMatchField: "ProductCode", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "mozilla firefox 159.0.1 (x64 en-us)"}},
 			{PackageMatchField: "NormalizedPackageNameAndPublisher", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "mozillafirefox"}},
 			{PackageMatchField: "NormalizedPackageNameAndPublisher", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "mozillafirefox(x64)"}},
 		},
 		nil,
 	)
+	if len(res) != 1 {
+		t.Fatalf("Firefox correlation returned %d packages, want the single locale-token match: %v", len(res), res)
+	}
+	if _, ok := res["Mozilla.Firefox"]; !ok {
+		t.Errorf("locale token picked the wrong package: %v", res)
+	}
+}
+
+// When the request carries no arch/locale token to intersect, the server must
+// NOT guess a winner: silently picking one of the variants would serve upgrade
+// metadata for a package the user did not install.
+func TestCorrelationWithoutStrongAnchorOrTokenDoesNotGuess(t *testing.T) {
+	ms := firefoxFamilyStore(t)
+
+	res, _ := ms.GetByMatchFilter(
+		[]API_SearchRequestPackageMatchFilter_1_1_0{
+			{PackageMatchField: "NormalizedPackageNameAndPublisher", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "mozillafirefox"}},
+		},
+		nil,
+	)
 	if got := len(res); got != 4 {
-		t.Errorf("Firefox correlation returned %d packages, want all 4 left unresolved rather than guessed: %v", got, res)
+		t.Errorf("tokenless Firefox fan-out returned %d packages, want all 4 left unresolved rather than guessed: %v", got, res)
 	}
 }
 
