@@ -20,7 +20,7 @@ import (
 func correlationStore(t *testing.T) *ManifestsStore {
 	t.Helper()
 	ms := &ManifestsStore{}
-	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)
+	ms.internal = make(map[string]map[string]manifestEntry)
 
 	ms.Set("Example.App", "1.0.0", &API_ManifestVersion_1_4_0{
 		PackageVersion: "1.0.0",
@@ -303,7 +303,7 @@ func TestSearchResponseWireShape(t *testing.T) {
 func normalizedPairStore(t *testing.T) *ManifestsStore {
 	t.Helper()
 	ms := &ManifestsStore{}
-	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)
+	ms.internal = make(map[string]map[string]manifestEntry)
 
 	for _, tc := range []struct{ version, productCode string }{
 		{"31.4.5", "{48AA8CF8-AC09-4435-AA45-43FFDFE27194}"},
@@ -412,7 +412,7 @@ func TestNormalizePackageNameCharacterClass(t *testing.T) {
 // newer one.
 func TestSDKStyleVersionTokenInNameStillCorrelates(t *testing.T) {
 	ms := &ManifestsStore{}
-	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)
+	ms.internal = make(map[string]map[string]manifestEntry)
 	for _, tc := range []struct{ version, productCode string }{
 		{"8.0.425", "{AB39B1D0-4847-4C0D-A1C1-B2BE697F2B76}"},
 		{"8.0.428", "{D76560AF-3660-42AF-8CEB-47FC58A70915}"},
@@ -452,7 +452,7 @@ func TestSDKStyleVersionTokenInNameStillCorrelates(t *testing.T) {
 func sdkFamilyStore(t *testing.T) *ManifestsStore {
 	t.Helper()
 	ms := &ManifestsStore{}
-	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)
+	ms.internal = make(map[string]map[string]manifestEntry)
 
 	for _, tc := range []struct{ id, version, name, productCode string }{
 		{"Microsoft.DotNet.SDK.8", "8.0.425", "Microsoft .NET SDK 8.0", "{AB39B1D0-4847-4C0D-A1C1-B2BE697F2B76}"},
@@ -526,7 +526,7 @@ func TestCorrelationCollapsesSdkSiblingsOntoStrongAnchor(t *testing.T) {
 func firefoxFamilyStore(t *testing.T) *ManifestsStore {
 	t.Helper()
 	ms := &ManifestsStore{}
-	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)
+	ms.internal = make(map[string]map[string]manifestEntry)
 
 	for _, tc := range []struct{ id, version, name string }{
 		{"Mozilla.Firefox", "159.0.1", "Mozilla Firefox (en-US)"},
@@ -666,7 +666,7 @@ func TestCorrelationDoesNotCollapseMultipleStrongMatches(t *testing.T) {
 func chromeFamilyStore(t *testing.T) *ManifestsStore {
 	t.Helper()
 	ms := &ManifestsStore{}
-	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)
+	ms.internal = make(map[string]map[string]manifestEntry)
 
 	ms.Set("Google.Chrome", "156.0.8078.80", &API_ManifestVersion_1_10_0{
 		PackageVersion: "156.0.8078.80",
@@ -770,7 +770,7 @@ func TestCorrelationBareStringChromeInstallKeepsStrongAnchor(t *testing.T) {
 func desktopRuntimeStore(t *testing.T) *ManifestsStore {
 	t.Helper()
 	ms := &ManifestsStore{}
-	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)
+	ms.internal = make(map[string]map[string]manifestEntry)
 
 	for _, tc := range []struct{ version, productCode string }{
 		{"10.0.12", "{F81499EB-06B3-470A-A4DB-D4B58AE6AEC2}"},
@@ -841,7 +841,7 @@ func TestComparePackageVersions(t *testing.T) {
 
 func TestVersionExpansionScopedToStrongAnchors(t *testing.T) {
 	ms := &ManifestsStore{}
-	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)
+	ms.internal = make(map[string]map[string]manifestEntry)
 	// Two versions whose default-locale names differ, so a PackageName filter
 	// discriminates per version; the ProductCode GUID exists only in 1.0.0.
 	for _, tc := range []struct{ version, name, productCode string }{

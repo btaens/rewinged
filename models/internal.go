@@ -20,14 +20,6 @@ type ManifestNode struct {
 	Node         yaml.Node `yaml:"-"`
 }
 
-func getMapValues[M ~map[K]V, K comparable, V any](m M) []V {
-	r := make([]V, 0, len(m))
-	for _, v := range m {
-		r = append(r, v)
-	}
-	return r
-}
-
 func caseInsensitiveContains(s, substr string) bool {
 	s, substr = strings.ToUpper(s), strings.ToUpper(substr)
 	return strings.Contains(s, substr)
@@ -116,26 +108,93 @@ func (store *InstallerSourcesStore) Get(installerSha string) (string, bool) {
 	return url, ok
 }
 
+// manifestEntry is the store's value type: a manifest version plus the values
+// the search path needs from it, derived once when the manifest is ingested.
+//
+// Why: a `winget list` correlation request carries a
+// NormalizedPackageNameAndPublisher inclusion, and evaluating that inclusion
+// meant running normalizePackageName (bracket loop, two version-regex loops to
+// a fixpoint, rune-class rebuild: 18-24us and 17 allocations) against EVERY
+// version in the store on EVERY request - 21us and 32 allocations per
+// version-doc, which is how a 150k-manifest repo answers one correlation in
+// seconds. Those values are a pure function of the stored manifest, so they are
+// computed at ingestion and compared as plain strings at search time (~0.5us).
+//
+// The raw interface is kept because the response fields, the findField-based
+// fields (PackageName/Moniker, which have no getter) and the arch/locale
+// tie-break all need the original manifest: the tie-break reads the bracket
+// groups ("(x64 en-US)", "(hu)") that normalizePackageName deliberately
+// deletes.
+//
+// Invalidation: the derived values live inside the store entry, so a live-reload
+// Set replaces them atomically together with the manifest - there is no separate
+// cache that can go stale. That holds only if a stored value is never mutated
+// after Set; nothing does today (ingestion reconstructs the manifest before
+// storing it, and on-demand internalization rewrites InstallerUrl, which is not
+// derived here).
+type manifestEntry struct {
+	version API_ManifestVersionInterface
+
+	normalizedPackageName string
+	productCodes          []string
+	packageFamilyNames    []string
+	upgradeCodes          []string
+
+	// Uppercased copies for GetByKeyword: the keyword search is a
+	// case-insensitive substring test, and caseInsensitiveContains would
+	// otherwise ToUpper both operands for every version-doc in the store on
+	// every search.
+	upperPackageName      string
+	upperShortDescription string
+}
+
+func newManifestEntry(value API_ManifestVersionInterface) manifestEntry {
+	packageName := value.GetDefaultLocalePackageName()
+	return manifestEntry{
+		version:               value,
+		normalizedPackageName: normalizePackageName(packageName),
+		productCodes:          value.GetInstallerProductCodes(),
+		packageFamilyNames:    value.GetInstallerPackageFamilyNames(),
+		upgradeCodes:          value.GetInstallerUpgradeCodes(),
+		upperPackageName:      strings.ToUpper(packageName),
+		upperShortDescription: strings.ToUpper(value.GetDefaultLocaleShortDescription()),
+	}
+}
+
+// entryVersions flattens a package's stored entries into the interface values
+// the search response and the tie-break rules work with.
+func entryVersions(entries map[string]manifestEntry) []API_ManifestVersionInterface {
+	result := make([]API_ManifestVersionInterface, 0, len(entries))
+	for _, entry := range entries {
+		result = append(result, entry.version)
+	}
+	return result
+}
+
 // Internal in-memory data store of all manifest data
 type ManifestsStore struct {
 	sync.RWMutex
-	internal map[string]map[string]API_ManifestVersionInterface
+	internal map[string]map[string]manifestEntry
 }
 
 func (ms *ManifestsStore) Set(packageidentifier string, packageversion string, value API_ManifestVersionInterface) {
+	// Derived values are computed before the lock is taken: normalization costs
+	// microseconds per manifest, 6 ingest workers share this mutex, and doing it
+	// inside the critical section would stall every concurrent search.
+	entry := newManifestEntry(value)
 	ms.Lock()
 	vmap, ok := ms.internal[packageidentifier]
 	if !ok {
-		vmap = make(map[string]API_ManifestVersionInterface)
+		vmap = make(map[string]manifestEntry)
 		ms.internal[packageidentifier] = vmap
 	}
-	vmap[packageversion] = value
+	vmap[packageversion] = entry
 	ms.Unlock()
 }
 
 func (ms *ManifestsStore) GetAllVersions(packageidentifier string) (value []API_ManifestVersionInterface) {
 	ms.RLock()
-	result := getMapValues(ms.internal[packageidentifier])
+	result := entryVersions(ms.internal[packageidentifier])
 	ms.RUnlock()
 	return result
 }
@@ -144,14 +203,14 @@ func (ms *ManifestsStore) Get(packageidentifier string, packageversion string) (
 	ms.RLock()
 	result := ms.internal[packageidentifier][packageversion]
 	ms.RUnlock()
-	return result
+	return result.version
 }
 
 func (ms *ManifestsStore) GetAll() (value map[string][]API_ManifestVersionInterface) {
 	ms.RLock()
 	var m = make(map[string][]API_ManifestVersionInterface)
 	for k := range ms.internal {
-		m[k] = getMapValues(ms.internal[k])
+		m[k] = entryVersions(ms.internal[k])
 	}
 	ms.RUnlock()
 	return m
@@ -178,11 +237,14 @@ func (ms *ManifestsStore) GetManifestCount() (value int) {
 
 func (ms *ManifestsStore) GetByKeyword(keyword string) map[string][]API_ManifestVersionInterface {
 	var manifestResultsMap = make(map[string][]API_ManifestVersionInterface)
+	// Uppercased once per request; the operands from the store are precomputed
+	// in manifestEntry. Same case folding as caseInsensitiveContains.
+	upperKeyword := strings.ToUpper(keyword)
 	ms.RLock()
 	for packageIdentifier, packageVersions := range ms.internal {
-		for _, version := range packageVersions {
-			if caseInsensitiveContains(version.GetDefaultLocalePackageName(), keyword) || caseInsensitiveContains(version.GetDefaultLocaleShortDescription(), keyword) {
-				manifestResultsMap[packageIdentifier] = append(manifestResultsMap[packageIdentifier], version)
+		for _, entry := range packageVersions {
+			if strings.Contains(entry.upperPackageName, upperKeyword) || strings.Contains(entry.upperShortDescription, upperKeyword) {
+				manifestResultsMap[packageIdentifier] = append(manifestResultsMap[packageIdentifier], entry.version)
 			}
 		}
 	}
@@ -383,7 +445,11 @@ func normalizePackageName(name string) string {
 }
 
 // searchFilterMatches evaluates one Inclusions/Filters entry against one
-// package version.
+// package version. entry carries the derived values (normalized name,
+// identifier lists) precomputed at ingestion; keyword is the filter's KeyWord
+// already passed through normalizePackageName, which GetByMatchFilter does once
+// per request - normalizing it per version-doc was the same 18-24us cost the
+// entry cache removes, just on the request side.
 //
 // Fields the server does not evaluate return (true, false) "matched but
 // unsupported". The reference implementation is lenient the same way (its
@@ -393,7 +459,7 @@ func normalizePackageName(name string) string {
 // request over one unmatchable field would break such a search outright. The
 // unsupported flag is what makes the leniency visible to the client instead of
 // a silent pass.
-func searchFilterMatches(packageIdentifier string, packageVersion API_ManifestVersionInterface, filter API_SearchRequestPackageMatchFilter_1_1_0) (matched bool, supported bool) {
+func searchFilterMatches(packageIdentifier string, entry manifestEntry, filter API_SearchRequestPackageMatchFilter_1_1_0, keyword string) (matched bool, supported bool) {
 	if !supportedSearchFields[filter.PackageMatchField] {
 		return true, false
 	}
@@ -409,13 +475,13 @@ func searchFilterMatches(packageIdentifier string, packageVersion API_ManifestVe
 		// https://github.com/microsoft/winget-cli-restsource/issues/59
 		//
 		// Both sides go through normalizePackageName: our value because the
-		// manifest stores the raw name, the keyword because a client-side
-		// normalization change must not silently break Exact matching here.
+		// manifest stores the raw name (cached in entry at ingestion), the
+		// keyword because a client-side normalization change must not silently
+		// break Exact matching here (normalized once per request by the caller).
 		// The client sends this inclusion with MatchType Exact.
-		normalized := normalizePackageName(packageVersion.GetDefaultLocalePackageName())
 		normalizedFilter := filter
-		normalizedFilter.RequestMatch.KeyWord = normalizePackageName(filter.RequestMatch.KeyWord)
-		return compareSearchValue(normalized, normalizedFilter.RequestMatch), true
+		normalizedFilter.RequestMatch.KeyWord = keyword
+		return compareSearchValue(entry.normalizedPackageName, normalizedFilter.RequestMatch), true
 	case "PackageIdentifier":
 		// We don't need to recursively search for this field, it's easy to get to
 		requestMatchValue := packageIdentifier
@@ -427,15 +493,15 @@ func searchFilterMatches(packageIdentifier string, packageVersion API_ManifestVe
 		// lookup would silently pick just one installer-level value. It also
 		// cannot resolve slice fields at all (reflect.Value.String() on a slice
 		// returns a placeholder like "<[]string Value>" that can never match).
-		return identifierMatches([]string{filter.RequestMatch.KeyWord}, packageVersion.GetInstallerPackageFamilyNames(), filter.RequestMatch.MatchType), true
+		return identifierMatches([]string{filter.RequestMatch.KeyWord}, entry.packageFamilyNames, filter.RequestMatch.MatchType), true
 	case "ProductCode":
 		// The reference server matches installer ProductCode OR any
 		// AppsAndFeaturesEntries ProductCode (PredicateGenerator.GetInstallerClause);
 		// GetInstallerProductCodes collects both, mirroring the client's
 		// Manifest::GetProductCodes correlation set.
-		return identifierMatches([]string{filter.RequestMatch.KeyWord}, packageVersion.GetInstallerProductCodes(), filter.RequestMatch.MatchType), true
+		return identifierMatches([]string{filter.RequestMatch.KeyWord}, entry.productCodes, filter.RequestMatch.MatchType), true
 	case "UpgradeCode":
-		return identifierMatches([]string{filter.RequestMatch.KeyWord}, packageVersion.GetInstallerUpgradeCodes(), filter.RequestMatch.MatchType), true
+		return identifierMatches([]string{filter.RequestMatch.KeyWord}, entry.upgradeCodes, filter.RequestMatch.MatchType), true
 	case "PackageName":
 		fallthrough
 	case "Moniker":
@@ -451,7 +517,7 @@ func searchFilterMatches(packageIdentifier string, packageVersion API_ManifestVe
 		// getters because the client's correlation set also includes
 		// AppsAndFeaturesEntries values, which findField's first-match-wins
 		// lookup cannot reach.
-		f := findField(packageVersion, string(filter.PackageMatchField))
+		f := findField(entry.version, string(filter.PackageMatchField))
 		requestMatchValue := string(f.String())
 		return compareSearchValue(requestMatchValue, filter.RequestMatch), true
 	}
@@ -668,6 +734,18 @@ func newestVersionTieBreak(results map[string][]API_ManifestVersionInterface) st
 	return ""
 }
 
+// searchKeyword returns the keyword form the field's comparison uses. Only
+// NormalizedPackageNameAndPublisher compares normalized values, so only that
+// field's KeyWord goes through normalizePackageName; every other field's
+// keyword is used raw (and the arch/locale tie-break requires the raw form with
+// its bracket groups).
+func searchKeyword(filter API_SearchRequestPackageMatchFilter_1_1_0) string {
+	if filter.PackageMatchField == "NormalizedPackageNameAndPublisher" {
+		return normalizePackageName(filter.RequestMatch.KeyWord)
+	}
+	return filter.RequestMatch.KeyWord
+}
+
 // GetByMatchFilter returns the matching package versions, and the sorted set of
 // PackageMatchField values from the request that this server does not evaluate
 // (for reporting in UnsupportedPackageMatchFields).
@@ -693,12 +771,32 @@ func (ms *ManifestsStore) GetByMatchFilter(
 		}
 	}
 
+	// NormalizedPackageNameAndPublisher comparison runs both sides through
+	// normalizePackageName. The store side is cached per manifest (see
+	// manifestEntry); the request side is normalized here, once per filter per
+	// request. Doing it inside the store loop renormalized the same constant
+	// string for every version in the store, which is the same 18-24us cost as
+	// normalizing a manifest name.
+	//
+	// Only the pair field uses the normalized form - every other field compares
+	// its keyword raw, and the arch/locale tie-break below needs the ORIGINAL
+	// keywords with their bracket groups intact, so the caller's slices are never
+	// rewritten.
+	filterKeywords := make([]string, len(filters))
+	for i, filter := range filters {
+		filterKeywords[i] = searchKeyword(filter)
+	}
+	inclusionKeywords := make([]string, len(inclusions))
+	for i, inclusion := range inclusions {
+		inclusionKeywords[i] = searchKeyword(inclusion)
+	}
+
 	ms.RLock()
 	for packageIdentifier, packageVersions := range ms.internal {
 		// Loop through every version of the package as well because MatchFields like
 		// ProductCode, PackageName etc. can change between versions.
 	NEXT_VERSION:
-		for _, packageVersion := range packageVersions {
+		for _, entry := range packageVersions {
 			// versionStrong is set when this version is matched directly by a strong
 			// identifier field (PFN/ProductCode/UpgradeCode), not only by a heuristic
 			// field such as the normalized name pair.
@@ -709,8 +807,8 @@ func (ms *ManifestsStore) GetByMatchFilter(
 			// (all filter specified have to match) - so this is what I implemented here. But I am not 100% sure this is the correct/intended use for inclusions vs. filters.
 
 			// process filters (if any)
-			for _, filter := range filters {
-				matched, _ := searchFilterMatches(packageIdentifier, packageVersion, filter)
+			for i, filter := range filters {
+				matched, _ := searchFilterMatches(packageIdentifier, entry, filter, filterKeywords[i])
 				// Because all filters (if any) must match (logical AND)
 				// we just skip to the next packageversion if any did not match
 				if !matched {
@@ -722,7 +820,7 @@ func (ms *ManifestsStore) GetByMatchFilter(
 			}
 
 			if len(inclusions) == 0 {
-				manifestResultsMap[packageIdentifier] = append(manifestResultsMap[packageIdentifier], packageVersion)
+				manifestResultsMap[packageIdentifier] = append(manifestResultsMap[packageIdentifier], entry.version)
 				if versionStrong {
 					packageStrong[packageIdentifier] = true
 				}
@@ -733,8 +831,8 @@ func (ms *ManifestsStore) GetByMatchFilter(
 			// Every inclusion is evaluated (no early break) so a strong field later in
 			// the list is still seen even when a weak field already satisfied the OR.
 			var anyInclusionMatched bool
-			for _, inclusion := range inclusions {
-				matched, _ := searchFilterMatches(packageIdentifier, packageVersion, inclusion)
+			for i, inclusion := range inclusions {
+				matched, _ := searchFilterMatches(packageIdentifier, entry, inclusion, inclusionKeywords[i])
 				if matched {
 					anyInclusionMatched = true
 					if strongMatchFields[inclusion.PackageMatchField] {
@@ -745,8 +843,8 @@ func (ms *ManifestsStore) GetByMatchFilter(
 
 			// All filters and inclusions have passed for this manifest, add it to the returned map
 			if anyInclusionMatched {
-				logging.Logger.Debug().Msgf("adding to the results map: %v version %v", packageIdentifier, packageVersion.GetPackageVersion())
-				manifestResultsMap[packageIdentifier] = append(manifestResultsMap[packageIdentifier], packageVersion)
+				logging.Logger.Debug().Msgf("adding to the results map: %v version %v", packageIdentifier, entry.version.GetPackageVersion())
+				manifestResultsMap[packageIdentifier] = append(manifestResultsMap[packageIdentifier], entry.version)
 				if versionStrong {
 					packageStrong[packageIdentifier] = true
 				}
@@ -901,5 +999,5 @@ var InstallerSources = InstallerSourcesStore{
 
 // Global variable that will hold all in-memory manifest data
 var Manifests = ManifestsStore{
-	internal: make(map[string]map[string]API_ManifestVersionInterface),
+	internal: make(map[string]map[string]manifestEntry),
 }

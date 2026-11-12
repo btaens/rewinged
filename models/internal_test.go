@@ -67,7 +67,7 @@ func TestInternalizedInstallersStore(t *testing.T) {
 
 func TestManifestsStoreBasics(t *testing.T) {
 	var ms ManifestsStore
-	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)
+	ms.internal = make(map[string]map[string]manifestEntry)
 
 	if n := ms.GetManifestCount(); n != 0 {
 		t.Errorf("count = %d, want 0", n)
@@ -127,7 +127,7 @@ func TestManifestsStoreBasics(t *testing.T) {
 // this is the test that catches the unsynchronized manifest access.
 func TestManifestsStoreConcurrentAccess(t *testing.T) {
 	var ms ManifestsStore
-	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)
+	ms.internal = make(map[string]map[string]manifestEntry)
 
 	var wg sync.WaitGroup
 	const writers = 6
@@ -199,7 +199,7 @@ func TestInstallerSourcesConcurrentAccess(t *testing.T) {
 
 func TestGetByKeywordAndFiltersSmoke(t *testing.T) {
 	var ms ManifestsStore
-	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)
+	ms.internal = make(map[string]map[string]manifestEntry)
 
 	ms.Set("Example.Laptop", "1.0.0", &API_ManifestVersion_1_4_0{
 		PackageVersion: "1.0.0",
