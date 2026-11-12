@@ -694,11 +694,15 @@ func chromeFamilyStore(t *testing.T) *ManifestsStore {
 	return ms
 }
 
-// The installed Chrome's ARP ProductCode is a brace GUID, so only the package
-// that itself declares GUID-shaped ProductCodes can be the installed one. That
-// is the last tie-break before the server gives up, and it matches how the
-// official source correlates the ARP GUID entry to Google.Chrome.
-func TestCorrelationResolvesChromeFanOutViaGuidShape(t *testing.T) {
+// The official source offers an installed Google Chrome 157.0.8103.50 the
+// upgrade to 157.0.8103.51 (user-verified with `winget list -s winget`), even
+// though that version belongs to Google.Chrome.EXE, which shares no
+// ProductCode or UpgradeCode with the install. Neither identity signal can
+// reach the server anyway (the client drops UpgradeCode from REST bodies), so
+// the correlation fan-out resolves to the package holding the newest version -
+// keeping the frozen Google.Chrome lineage would leave the Available column
+// empty forever, the opposite of official behavior.
+func TestCorrelationResolvesChromeFanOutToNewestPackage(t *testing.T) {
 	ms := chromeFamilyStore(t)
 
 	// Exact wire body from the live log for the installed Chrome.
@@ -710,18 +714,34 @@ func TestCorrelationResolvesChromeFanOutViaGuidShape(t *testing.T) {
 		nil,
 	)
 	if len(res) != 1 {
-		t.Fatalf("Chrome correlation returned %d packages, want the single GUID-shaped one: %v", len(res), res)
+		t.Fatalf("Chrome correlation returned %d packages, want the single newest one: %v", len(res), res)
 	}
-	if _, ok := res["Google.Chrome"]; !ok {
-		t.Errorf("GUID shape tie-break picked the wrong package: %v", res)
+	if got := len(res["Google.Chrome.EXE"]); got != 2 {
+		t.Errorf("Chrome correlation kept %d versions of Google.Chrome.EXE, want both 2 so 157.0.8103.51 shows as Available", got)
 	}
 }
 
-// The tie-break must not fire for a genuine Chrome.EXE install: its ARP
-// ProductCode is the bare string "Google Chrome", the keyword is not
-// GUID-shaped, and that install keeps correlating through its exact
-// ProductCode match on the strong-anchor rule.
-func TestGuidShapeTieBreakDoesNotFireForBareStringInstall(t *testing.T) {
+// A user-issued name search (no identifier field in the request) must not be
+// narrowed by the newest-package fallback - with no correlation to serve,
+// returning every name match is the correct answer.
+func TestNewestPackageFallbackNotAppliedToNameSearch(t *testing.T) {
+	ms := chromeFamilyStore(t)
+
+	res, _ := ms.GetByMatchFilter(
+		[]API_SearchRequestPackageMatchFilter_1_1_0{
+			{PackageMatchField: "NormalizedPackageNameAndPublisher", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "googlechrome"}},
+		},
+		nil,
+	)
+	if got := len(res); got != 2 {
+		t.Errorf("pair-only Chrome search returned %d packages, want both 2 left intact: %v", got, res)
+	}
+}
+
+// A genuine Chrome.EXE install never reaches the fallback: its ARP ProductCode
+// is the bare string "Google Chrome", which matches its manifest exactly, so
+// the strong-anchor rule resolves it.
+func TestCorrelationBareStringChromeInstallKeepsStrongAnchor(t *testing.T) {
 	ms := chromeFamilyStore(t)
 
 	res, _ := ms.GetByMatchFilter(
@@ -795,6 +815,30 @@ func TestCorrelationExpandsStrongAnchoredPackageToAllVersions(t *testing.T) {
 // only through a name-ish field still returns only the versions that matched,
 // so a plain `winget search` on a name criterion keeps answering with matching
 // versions rather than every release the package ever had.
+func TestComparePackageVersions(t *testing.T) {
+	higher := [][2]string{
+		{"157.0.8103.51", "156.0.8078.80"},
+		{"157.0.8103.51", "157.0.8103.39"},
+		{"10.0.15", "10.0.12"},
+		{"1.10.0", "1.9.0"},
+		{"2.0", "1.99.99"},
+		{"10", "9"},
+		{"1.2.3.4", "1.2.3"},
+		{"159.0.1", "159.0"},
+	}
+	for _, pair := range higher {
+		if got := comparePackageVersions(pair[0], pair[1]); got != 1 {
+			t.Errorf("comparePackageVersions(%q, %q) = %d, want 1", pair[0], pair[1], got)
+		}
+		if got := comparePackageVersions(pair[1], pair[0]); got != -1 {
+			t.Errorf("comparePackageVersions(%q, %q) = %d, want -1", pair[1], pair[0], got)
+		}
+	}
+	if got := comparePackageVersions("1.2.3", "1.2.3"); got != 0 {
+		t.Errorf("comparePackageVersions equal = %d, want 0", got)
+	}
+}
+
 func TestVersionExpansionScopedToStrongAnchors(t *testing.T) {
 	ms := &ManifestsStore{}
 	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)

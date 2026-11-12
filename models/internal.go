@@ -558,59 +558,108 @@ func localeTokenTieBreak(results map[string][]API_ManifestVersionInterface, requ
 	return ""
 }
 
-// guidShapeRe matches the brace-wrapped GUID form a wix/burn installer reports
-// as ProductCode, which is also what AppsAndFeaturesEntries carry for an MSI
-// install ("{6997c0ae-1f06-38b6-9645-72da2bbe5bf6}"). Bare-string ProductCodes
-// like "Google Chrome" never match it.
-var guidShapeRe = regexp.MustCompile(`(?i)^\{[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\}$`)
+// versionRunRe splits a version string into alternating digit and non-digit
+// runs for comparison.
+var versionRunRe = regexp.MustCompile(`\d+|\D+`)
 
-// guidShapeTieBreak resolves a no-strong-anchor correlation fan-out by
-// install-technology identity: a brace-GUID ProductCode keyword means the
-// installed app registered a wix/burn identifier, so only a package that
-// itself declares GUID-shaped ProductCodes can be the installed one. The live
-// Google.Chrome case: the installed GUID matches no manifest at all (recent
-// Chrome releases moved to Google.Chrome.EXE, whose ProductCode is the bare
-// string "Google Chrome"), both packages arrive only through the normalized
-// pair ("Google Chrome" and "Google Chrome (EXE)" both normalize to
-// "googlechrome"), and exactly one candidate - Google.Chrome - speaks
-// GUID-shaped ProductCodes, the same conclusion the official source reaches by
-// correlating the ARP GUID entry against Google.Chrome's own entries. A real
-// Chrome.EXE install reports the bare string, the keyword is not GUID-shaped,
-// and this rule cannot fire - that install keeps correlating through its exact
-// ProductCode match. It runs only after the locale-token rule, inside a
-// fan-out the client discards anyway, so it can only turn a certain loss into
-// a win or leave the loss intact.
-func guidShapeTieBreak(results map[string][]API_ManifestVersionInterface, requestFilters []API_SearchRequestPackageMatchFilter_1_1_0) string {
-	requestIsGUID := false
+// comparePackageVersions orders two PackageVersion strings by comparing their
+// digit runs numerically and their non-digit runs lexically (digit runs sort
+// after non-digit runs, which keeps a suffix like "-beta" before the next
+// numeric segment). It is deliberately simpler than the client's Version.cpp
+// (no Unicode collation, no full prerelease grammar); it only has to pick the
+// newest member of one package family, e.g. "157.0.8103.51" over
+// "156.0.8078.80" or "1.10.0" over "1.9.0", where the shapes agree.
+func comparePackageVersions(a, b string) int {
+	aRuns := versionRunRe.FindAllString(a, -1)
+	bRuns := versionRunRe.FindAllString(b, -1)
+	for i := 0; i < len(aRuns) && i < len(bRuns); i++ {
+		x, y := aRuns[i], bRuns[i]
+		if x == y {
+			continue
+		}
+		xDigit := x[0] >= '0' && x[0] <= '9'
+		yDigit := y[0] >= '0' && y[0] <= '9'
+		if xDigit != yDigit {
+			if xDigit {
+				return 1
+			}
+			return -1
+		}
+		if xDigit {
+			// Numeric compare by length then lexically after stripping leading
+			// zeros, so "10" > "9" and no integer overflow is possible.
+			x, y = strings.TrimLeft(x, "0"), strings.TrimLeft(y, "0")
+			if len(x) != len(y) {
+				if len(x) < len(y) {
+					return -1
+				}
+				return 1
+			}
+		}
+		if x < y {
+			return -1
+		}
+		return 1
+	}
+	if len(aRuns) != len(bRuns) {
+		if len(aRuns) < len(bRuns) {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
+// identifierFieldRequested reports whether the request asked for a strong
+// identifier field. CompositeSource correlation searches always include one
+// (ProductCode at minimum, see CompositeSource::FindAvailablePackage); a
+// user-issued name search does not, so this separates the two despite the
+// REST body carrying no explicit search purpose.
+func identifierFieldRequested(requestFilters []API_SearchRequestPackageMatchFilter_1_1_0) bool {
 	for _, f := range requestFilters {
-		if f.PackageMatchField == "ProductCode" && guidShapeRe.MatchString(f.RequestMatch.KeyWord) {
-			requestIsGUID = true
-			break
+		if strongMatchFields[f.PackageMatchField] {
+			return true
 		}
 	}
-	if !requestIsGUID {
-		return ""
-	}
+	return false
+}
 
+// newestVersionTieBreak is the final fallback for a correlation fan-out with
+// no strong anchor and no arch/locale token: keep the package whose newest
+// matched version is highest. This reproduces what the closed official source
+// demonstrably does for a same-name collision: an installed Google Chrome
+// (ARP GUID that no manifest declares, pair keyword "googlechrome") is offered
+// the newest Google Chrome of any lineage - 157.0.8103.51 from
+// Google.Chrome.EXE - although that package shares no ProductCode or
+// UpgradeCode with the install (the EXE manifests declare no UpgradeCode at
+// all, and the client drops UpgradeCode from REST bodies: "Skipping
+// unsupported package match field: 7"), so no identity signal on the wire can
+// reach it. Install-technology heuristics fail here: the same shape argument
+// that keeps the dead Google.Chrome lineage (frozen at 156) makes the upgrade
+// row permanently empty, which is the opposite of the official behavior.
+// Cost, stated: if the user genuinely installed the older lineage while a
+// newer same-named package exists, the newer lineage is offered as the
+// upgrade. That trade is accepted deliberately: a wrong-but-current upgrade
+// offer is recoverable, the app vanishing from `winget list` is not.
+// Equal highest versions across candidates is a genuine tie and is left
+// uncollapsed rather than guessed.
+func newestVersionTieBreak(results map[string][]API_ManifestVersionInterface) string {
 	var winner string
+	var winnerBest string
 	winners := 0
 	for identifier, packageVersions := range results {
+		var best string
 		for _, packageVersion := range packageVersions {
-			declaresGUID := false
-			for _, productCode := range packageVersion.GetInstallerProductCodes() {
-				if guidShapeRe.MatchString(productCode) {
-					declaresGUID = true
-					break
-				}
-			}
-			if declaresGUID {
-				winner = identifier
-				winners++
-				break
+			version := packageVersion.GetPackageVersion()
+			if best == "" || comparePackageVersions(version, best) > 0 {
+				best = version
 			}
 		}
-		if winners > 1 {
-			return ""
+		switch {
+		case winners == 0 || comparePackageVersions(best, winnerBest) > 0:
+			winner, winnerBest, winners = identifier, best, 1
+		case comparePackageVersions(best, winnerBest) == 0:
+			winners++
 		}
 	}
 	if winners == 1 {
@@ -739,16 +788,18 @@ func (ms *ManifestsStore) GetByMatchFilter(
 	// the official winget source lands on the base package for an en-US install);
 	// a candidate counts if ANY of its matched versions carries the token, since
 	// package names evolve across releases. If no token or several candidates match,
-	// the ambiguity is real and the result is returned unchanged rather than
-	// guessed: nothing else on the wire
-	// distinguishes "Microsoft .NET SDK 9.0" from "8.0" once both normalize to
-	// the same keyword, and picking one would be a guess the client has no way
-	// to confirm.
+	// the ambiguity is real for a plain name search and the result is returned
+	// unchanged rather than guessed: nothing on the wire distinguishes
+	// "Microsoft .NET SDK 9.0" from "8.0" once both normalize to the same
+	// keyword, and picking one would be a guess the client has no way to
+	// confirm.
 	//
-	// ProductCode shape is a second wire-available signal when no token exists:
-	// a brace-GUID keyword means a wix/burn install, so only a package whose own
-	// ProductCodes are GUID-shaped can be it (installed Google Chrome GUID ->
-	// Google.Chrome, never Google.Chrome.EXE with its bare "Google Chrome").
+	// For the correlation shape (an identifier field was requested), the final
+	// fallback is the newest package of the fan-out, which is what the closed
+	// official source offers for the live Google.Chrome collision - the
+	// install-technology alternative keeps a frozen lineage and leaves the
+	// Available column empty forever. See newestVersionTieBreak for the
+	// trade-off, stated there.
 	//
 	// This only collapses genuinely mixed-strength results. A search whose every
 	// package matched through a strong field (e.g. Filters on ProductCode, which is
@@ -778,9 +829,9 @@ func (ms *ManifestsStore) GetByMatchFilter(
 			requestFilters := append(append([]API_SearchRequestPackageMatchFilter_1_1_0{}, inclusions...), filters...)
 			tie := localeTokenTieBreak(manifestResultsMap, requestFilters)
 			rule := "unique architecture/locale token"
-			if tie == "" {
-				tie = guidShapeTieBreak(manifestResultsMap, requestFilters)
-				rule = "unique GUID-shaped ProductCode"
+			if tie == "" && identifierFieldRequested(requestFilters) {
+				tie = newestVersionTieBreak(manifestResultsMap)
+				rule = "newest matching package"
 			}
 			if tie != "" {
 				logging.Logger.Debug().Msgf("correlation disambiguation: %v package(s) matched with no strong anchor, keeping %v on the %v", len(manifestResultsMap), tie, rule)
