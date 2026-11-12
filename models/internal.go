@@ -521,17 +521,35 @@ func localeTokenTieBreak(results map[string][]API_ManifestVersionInterface, requ
 		return ""
 	}
 
+	// Every matched version of a candidate is examined, not just one: a
+	// package's manifest name changes over time - the base Mozilla.Firefox
+	// releases before 140.0 are named "Mozilla Firefox" with no "(en-US)"
+	// bracket at all, newer ones "Mozilla Firefox (en-US)" - and the store
+	// iterates a Go map, so picking a single version makes the result depend
+	// on randomized map order (the live 2026-11-12 13:23 log: the same request
+	// that correlated Firefox hours earlier returned the full ~90-package
+	// fan-out because the first-iterated base version predated the token).
 	var winner string
 	winners := 0
 	for identifier, packageVersions := range results {
-		// GetDefaultLocalePackageName is the raw name, bracket groups included -
-		// the same value the search response serializes as PackageName.
-		for token := range bracketTokens(packageVersions[0].GetDefaultLocalePackageName()) {
-			if requestTokens[token] {
-				winner = identifier
-				winners++
+		matchesToken := false
+		for _, packageVersion := range packageVersions {
+			// GetDefaultLocalePackageName is the raw name, bracket groups
+			// included - the same value the search response serializes as
+			// PackageName.
+			for token := range bracketTokens(packageVersion.GetDefaultLocalePackageName()) {
+				if requestTokens[token] {
+					matchesToken = true
+					break
+				}
+			}
+			if matchesToken {
 				break
 			}
+		}
+		if matchesToken {
+			winner = identifier
+			winners++
 		}
 	}
 	if winners == 1 {
@@ -719,8 +737,10 @@ func (ms *ManifestsStore) GetByMatchFilter(
 	// default-locale name ("Mozilla Firefox (hu)", "(MSIX)"). Exactly one
 	// candidate whose name tokens intersect the request tokens wins (this is how
 	// the official winget source lands on the base package for an en-US install);
-	// if no token or several candidates match, the ambiguity is real and the
-	// result is returned unchanged rather than guessed: nothing else on the wire
+	// a candidate counts if ANY of its matched versions carries the token, since
+	// package names evolve across releases. If no token or several candidates match,
+	// the ambiguity is real and the result is returned unchanged rather than
+	// guessed: nothing else on the wire
 	// distinguishes "Microsoft .NET SDK 9.0" from "8.0" once both normalize to
 	// the same keyword, and picking one would be a guess the client has no way
 	// to confirm.

@@ -579,6 +579,44 @@ func TestCorrelationResolvesLocaleFanOutViaArchLocaleToken(t *testing.T) {
 	}
 }
 
+// The token scan must cover every matched version of a candidate, not one
+// representative version. Manifest names evolve across releases: base
+// Mozilla.Firefox before 140.0 is named "Mozilla Firefox" (no locale bracket),
+// from 140.0 on it is "Mozilla Firefox (en-US)". Because the store is a Go map,
+// sampling a single version makes the tie-break depend on randomized iteration
+// order - the live 2026-11-12 13:23 log shows the exact request that
+// correlated Firefox hours earlier returning the full ~90-package fan-out
+// instead, which the client discarded.
+func TestLocaleTokenTieBreakScansAllMatchedVersions(t *testing.T) {
+	// The token-less legacy version is deliberately placed first, which is
+	// what a bad map draw produces in production.
+	results := map[string][]API_ManifestVersionInterface{
+		"Mozilla.Firefox": {
+			&API_ManifestVersion_1_10_0{
+				PackageVersion: "130.0",
+				DefaultLocale:  API_DefaultLocale_1_10_0{PackageName: "Mozilla Firefox"},
+			},
+			&API_ManifestVersion_1_10_0{
+				PackageVersion: "159.0",
+				DefaultLocale:  API_DefaultLocale_1_10_0{PackageName: "Mozilla Firefox (en-US)"},
+			},
+		},
+		"Mozilla.Firefox.hu": {
+			&API_ManifestVersion_1_10_0{
+				PackageVersion: "159.0",
+				DefaultLocale:  API_DefaultLocale_1_10_0{PackageName: "Mozilla Firefox (hu)"},
+			},
+		},
+	}
+	requestFilters := []API_SearchRequestPackageMatchFilter_1_1_0{
+		{PackageMatchField: "ProductCode", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "mozilla firefox 159.0 (x64 en-us)"}},
+	}
+
+	if got := localeTokenTieBreak(results, requestFilters); got != "Mozilla.Firefox" {
+		t.Errorf("localeTokenTieBreak = %q, want Mozilla.Firefox despite the token-less version ordering first", got)
+	}
+}
+
 // When the request carries no arch/locale token to intersect, the server must
 // NOT guess a winner: silently picking one of the variants would serve upgrade
 // metadata for a package the user did not install.
