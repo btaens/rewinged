@@ -613,3 +613,193 @@ func TestCorrelationDoesNotCollapseMultipleStrongMatches(t *testing.T) {
 		t.Errorf("two strong ProductCode inclusions returned %d packages, want both 2: %v", got, res)
 	}
 }
+
+// chromeFamilyStore reproduces the real community-repo layout behind the live
+// 2026-11-12 Google.Chrome failure (values taken from upstream manifests): an
+// installed Chrome reports a wix/burn GUID ProductCode that no current manifest
+// declares - Google.Chrome's last standalone release (156.0.8078.80) carries
+// other GUIDs, and current releases live under Google.Chrome.EXE, whose
+// ProductCode is the bare string "Google Chrome". Both packages therefore reach
+// the correlation response only through the normalized pair ("Google Chrome"
+// and "Google Chrome (EXE)" both normalize to "googlechrome"), the request
+// carries no bracketed arch/locale token, and the client discards the
+// multi-package response ("Appropriate available package could not be
+// determined") so Chrome disappears from `winget list`.
+func chromeFamilyStore(t *testing.T) *ManifestsStore {
+	t.Helper()
+	ms := &ManifestsStore{}
+	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)
+
+	ms.Set("Google.Chrome", "156.0.8078.80", &API_ManifestVersion_1_10_0{
+		PackageVersion: "156.0.8078.80",
+		DefaultLocale: API_DefaultLocale_1_10_0{
+			PackageName:      "Google Chrome",
+			Publisher:        "Google LLC",
+			ShortDescription: "web browser",
+		},
+		Installers: []API_Installer_1_10_0{
+			{ProductCode: "{9D174563-1E7E-3ECA-874E-CEFBFE58C98F}"},
+			{ProductCode: "{50354927-E098-35AA-A0B1-3226D8CB43B6}"},
+		},
+	})
+	for _, version := range []string{"157.0.8103.39", "157.0.8103.51"} {
+		ms.Set("Google.Chrome.EXE", version, &API_ManifestVersion_1_10_0{
+			PackageVersion: version,
+			DefaultLocale: API_DefaultLocale_1_10_0{
+				PackageName:      "Google Chrome (EXE)",
+				Publisher:        "Google LLC",
+				ShortDescription: "web browser",
+			},
+			Installers: []API_Installer_1_10_0{{ProductCode: "Google Chrome"}},
+		})
+	}
+	return ms
+}
+
+// The installed Chrome's ARP ProductCode is a brace GUID, so only the package
+// that itself declares GUID-shaped ProductCodes can be the installed one. That
+// is the last tie-break before the server gives up, and it matches how the
+// official source correlates the ARP GUID entry to Google.Chrome.
+func TestCorrelationResolvesChromeFanOutViaGuidShape(t *testing.T) {
+	ms := chromeFamilyStore(t)
+
+	// Exact wire body from the live log for the installed Chrome.
+	res, _ := ms.GetByMatchFilter(
+		[]API_SearchRequestPackageMatchFilter_1_1_0{
+			{PackageMatchField: "ProductCode", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "{6997c0ae-1f06-38b6-9645-72da2bbe5bf6}"}},
+			{PackageMatchField: "NormalizedPackageNameAndPublisher", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "googlechrome"}},
+		},
+		nil,
+	)
+	if len(res) != 1 {
+		t.Fatalf("Chrome correlation returned %d packages, want the single GUID-shaped one: %v", len(res), res)
+	}
+	if _, ok := res["Google.Chrome"]; !ok {
+		t.Errorf("GUID shape tie-break picked the wrong package: %v", res)
+	}
+}
+
+// The tie-break must not fire for a genuine Chrome.EXE install: its ARP
+// ProductCode is the bare string "Google Chrome", the keyword is not
+// GUID-shaped, and that install keeps correlating through its exact
+// ProductCode match on the strong-anchor rule.
+func TestGuidShapeTieBreakDoesNotFireForBareStringInstall(t *testing.T) {
+	ms := chromeFamilyStore(t)
+
+	res, _ := ms.GetByMatchFilter(
+		[]API_SearchRequestPackageMatchFilter_1_1_0{
+			{PackageMatchField: "ProductCode", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "Google Chrome"}},
+			{PackageMatchField: "NormalizedPackageNameAndPublisher", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "googlechrome"}},
+		},
+		nil,
+	)
+	if len(res) != 1 {
+		t.Fatalf("bare-string Chrome.EXE correlation returned %d packages, want the single strong match: %v", len(res), res)
+	}
+	if _, ok := res["Google.Chrome.EXE"]; !ok {
+		t.Errorf("strong anchor picked the wrong package: %v", res)
+	}
+}
+
+// desktopRuntimeStore reproduces the live 2026-11-12
+// Microsoft.DotNet.DesktopRuntime.10 failure from real upstream manifests: wix
+// ProductCodes rotate per release ({F81499EB-...} exists only in 10.0.12), and
+// the ARP-derived pair keyword "microsoftwindowsdesktopruntime" never matches
+// the manifest name "Microsoft .NET Windows Desktop Runtime 10.0" (which
+// normalizes to "microsoftnetwindowsdesktopruntime"). Only the installed
+// version matches, so returning matched versions alone leaves the client with
+// latest == installed and no Available row.
+func desktopRuntimeStore(t *testing.T) *ManifestsStore {
+	t.Helper()
+	ms := &ManifestsStore{}
+	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)
+
+	for _, tc := range []struct{ version, productCode string }{
+		{"10.0.12", "{F81499EB-06B3-470A-A4DB-D4B58AE6AEC2}"},
+		{"10.0.15", "{5D9EBA24-3CD2-45F6-999C-3B0E6D1AB880}"},
+	} {
+		ms.Set("Microsoft.DotNet.DesktopRuntime.10", tc.version, &API_ManifestVersion_1_10_0{
+			PackageVersion: tc.version,
+			DefaultLocale: API_DefaultLocale_1_10_0{
+				PackageName:      "Microsoft .NET Windows Desktop Runtime 10.0",
+				Publisher:        "Microsoft Corporation",
+				ShortDescription: ".NET Desktop Runtime",
+			},
+			Installers: []API_Installer_1_10_0{{ProductCode: tc.productCode}},
+		})
+	}
+	return ms
+}
+
+// The strong ProductCode anchor identifies the package, not the version: the
+// response must carry every version the store holds so the client can compute
+// GetLatestVersion and offer the upgrade.
+func TestCorrelationExpandsStrongAnchoredPackageToAllVersions(t *testing.T) {
+	ms := desktopRuntimeStore(t)
+
+	// Exact wire body from the live log for the installed 10.0.12.50000.
+	res, _ := ms.GetByMatchFilter(
+		[]API_SearchRequestPackageMatchFilter_1_1_0{
+			{PackageMatchField: "ProductCode", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "{f81499eb-06b3-470a-a4db-d4b58ae6aec2}"}},
+			{PackageMatchField: "NormalizedPackageNameAndPublisher", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "microsoftwindowsdesktopruntime"}},
+		},
+		nil,
+	)
+	if len(res) != 1 {
+		t.Fatalf("DesktopRuntime correlation matched %d packages, want 1: %v", len(res), res)
+	}
+	if got := len(res["Microsoft.DotNet.DesktopRuntime.10"]); got != 2 {
+		t.Errorf("DesktopRuntime correlation returned %d versions, want both 2 so 10.0.15 shows as Available", got)
+	}
+}
+
+// Version expansion is scoped to strong identifier anchors. A package reached
+// only through a name-ish field still returns only the versions that matched,
+// so a plain `winget search` on a name criterion keeps answering with matching
+// versions rather than every release the package ever had.
+func TestVersionExpansionScopedToStrongAnchors(t *testing.T) {
+	ms := &ManifestsStore{}
+	ms.internal = make(map[string]map[string]API_ManifestVersionInterface)
+	// Two versions whose default-locale names differ, so a PackageName filter
+	// discriminates per version; the ProductCode GUID exists only in 1.0.0.
+	for _, tc := range []struct{ version, name, productCode string }{
+		{"1.0.0", "Widget One", "{11111111-1111-1111-1111-111111111111}"},
+		{"2.0.0", "Widget Two", ""},
+	} {
+		ms.Set("Example.Widget", tc.version, &API_ManifestVersion_1_10_0{
+			PackageVersion: tc.version,
+			DefaultLocale: API_DefaultLocale_1_10_0{
+				PackageName:      tc.name,
+				Publisher:        "Example",
+				ShortDescription: "widget",
+			},
+			Installers: []API_Installer_1_10_0{{ProductCode: tc.productCode}},
+		})
+	}
+
+	// Weak name field only: exactly the matching version.
+	res, _ := ms.GetByMatchFilter(
+		[]API_SearchRequestPackageMatchFilter_1_1_0{
+			{PackageMatchField: "PackageName", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "Widget One"}},
+		},
+		nil,
+	)
+	if len(res) != 1 {
+		t.Fatalf("PackageName search matched %d packages, want 1: %v", len(res), res)
+	}
+	if got := len(res["Example.Widget"]); got != 1 {
+		t.Errorf("non-strong search returned %d versions, want only the 1 matching version", got)
+	}
+
+	// Strong anchor present: the same package expands to all its versions.
+	res, _ = ms.GetByMatchFilter(
+		[]API_SearchRequestPackageMatchFilter_1_1_0{
+			{PackageMatchField: "ProductCode", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "{11111111-1111-1111-1111-111111111111}"}},
+			{PackageMatchField: "PackageName", RequestMatch: API_SearchRequestMatch_1_1_0{MatchType: "Exact", KeyWord: "Widget One"}},
+		},
+		nil,
+	)
+	if got := len(res["Example.Widget"]); got != 2 {
+		t.Errorf("strong-anchored search returned %d versions, want both 2", got)
+	}
+}
